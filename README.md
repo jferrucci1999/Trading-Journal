@@ -32,7 +32,9 @@ npm run dev
 
 ## Data Storage
 
-All entries save locally in your browser (IndexedDB via window.storage).
+All entries save locally in your browser (localStorage) — nothing is sent to a server.
+Since it's local to one browser, use the **Export/Import** buttons in the sidebar to
+move your data to another browser or device, or as a backup.
 
 ## Features
 
