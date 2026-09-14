@@ -239,6 +239,7 @@ export default function TradingJournal() {
   const [syncCode, setSyncCodeState] = useState('');
   const [syncCodeDraft, setSyncCodeDraft] = useState('');
   const [cloudStatus, setCloudStatus] = useState(null);
+  const [showSyncModal, setShowSyncModal] = useState(false);
 
   const handleEarningsFileUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -786,6 +787,52 @@ export default function TradingJournal() {
   const isToday = currentDate === todayKey();
   const sortedDates = Object.keys(allEntries).sort().reverse();
 
+  // Shared between the desktop sidebar and the mobile Sync modal so both
+  // stay in sync (pun intended) with a single implementation.
+  const syncPanel = (
+    <>
+      {syncCode ? (
+        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
+          <div style={{ fontSize: 10, color: '#71717a', marginBottom: 6 }}>Enter this code on your other device:</div>
+          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+            <code className="number-font" style={{ flex: 1, fontSize: 11, color: '#93c5fd', wordBreak: 'break-all', background: 'rgba(0,0,0,0.2)', padding: '6px 8px', borderRadius: 6 }}>{syncCode}</code>
+            <button onClick={handleCopySyncCode} className="nav-btn" style={{ padding: '6px 8px', fontSize: 11 }}>Copy</button>
+          </div>
+          <button onClick={handleDisconnectSync} style={{ marginTop: 8, background: 'none', border: 'none', color: '#71717a', fontSize: 10, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+            Disconnect this device
+          </button>
+        </div>
+      ) : (
+        <div style={{ display: 'grid', gap: 8 }}>
+          <button onClick={handleGenerateSyncCode} className="nav-btn" style={{ justifyContent: 'center', fontSize: 12 }}>
+            Set Up Sync
+          </button>
+          <div style={{ display: 'flex', gap: 6 }}>
+            <input
+              placeholder="Or paste a code…"
+              value={syncCodeDraft}
+              onChange={(e) => setSyncCodeDraft(e.target.value)}
+              style={{ flex: 1, fontSize: 11, padding: '8px 10px' }}
+            />
+            <button onClick={handleConnectSyncCode} className="nav-btn" style={{ fontSize: 11, padding: '8px 10px' }} disabled={!syncCodeDraft.trim()}>
+              Connect
+            </button>
+          </div>
+        </div>
+      )}
+      {cloudStatus && (
+        <div style={{
+          marginTop: 8, padding: '8px 12px', borderRadius: 6, fontSize: 11, lineHeight: 1.4,
+          background: cloudStatus.type === 'error' ? 'rgba(239,68,68,0.1)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.04)',
+          color: cloudStatus.type === 'error' ? '#fca5a5' : cloudStatus.type === 'success' ? '#6ee7b7' : '#a1a1aa',
+          border: `1px solid ${cloudStatus.type === 'error' ? 'rgba(239,68,68,0.2)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.2)' : 'rgba(255,255,255,0.06)'}`,
+        }}>
+          {cloudStatus.msg}
+        </div>
+      )}
+    </>
+  );
+
   return (
     <div style={{ minHeight: '100vh', background: 'radial-gradient(ellipse at top, #0f1e3d 0%, #060a14 60%)', color: '#e4e4e7', fontFamily: '"Inter", -apple-system, sans-serif' }}>
       <Head>
@@ -966,10 +1013,66 @@ export default function TradingJournal() {
           backdrop-filter: blur(10px);
         }
 
+        /* Floating Cloud Sync entry point — desktop already has it in the
+           sidebar, so this stays hidden until the mobile media query below
+           turns it on. */
+        .mobile-sync-btn {
+          display: none;
+        }
+        .sync-modal-backdrop {
+          position: fixed;
+          inset: 0;
+          background: rgba(0,0,0,0.6);
+          backdrop-filter: blur(2px);
+          z-index: 100;
+          display: flex;
+          align-items: flex-end;
+          justify-content: center;
+        }
+        .sync-modal {
+          width: 100%;
+          max-width: 420px;
+          background: #0f1524;
+          border: 1px solid rgba(255,255,255,0.08);
+          border-radius: 16px 16px 0 0;
+          padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
+          box-shadow: 0 -8px 30px rgba(0,0,0,0.4);
+        }
+
         /* Phones/small tablets: sidebar becomes a fixed bottom tab bar so daily
            check-ins are usable one-handed; secondary tools (tlg import, backup
-           export/import) stay desktop-only for now. */
+           export/import) stay desktop-only for now — reachable instead via the
+           floating Cloud Sync button (Export/Import remain desktop-only). */
         @media (max-width: 860px) {
+          .mobile-sync-btn {
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            position: fixed;
+            top: calc(14px + env(safe-area-inset-top));
+            right: 14px;
+            width: 40px;
+            height: 40px;
+            border-radius: 999px;
+            background: rgba(15,21,36,0.9);
+            border: 1px solid rgba(255,255,255,0.12);
+            color: #93c5fd;
+            z-index: 60;
+            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
+          }
+          .mobile-sync-dot {
+            position: absolute;
+            top: 6px;
+            right: 6px;
+            width: 8px;
+            height: 8px;
+            border-radius: 999px;
+            background: #34d399;
+            border: 1.5px solid rgba(15,21,36,0.9);
+          }
+          .sync-modal-backdrop {
+            align-items: flex-end;
+          }
           .sidebar {
             position: fixed;
             left: 0; right: 0; bottom: 0; top: auto;
@@ -1106,51 +1209,49 @@ export default function TradingJournal() {
 
           <div className="sidebar-extra" style={{ marginTop: 14, padding: '0 4px' }}>
             <div style={{ fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#52525b', marginBottom: 8, paddingLeft: 4 }}>Cloud Sync</div>
-            {syncCode ? (
-              <div style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
-                <div style={{ fontSize: 10, color: '#71717a', marginBottom: 6 }}>Enter this code on your other device:</div>
-                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-                  <code className="number-font" style={{ flex: 1, fontSize: 11, color: '#93c5fd', wordBreak: 'break-all', background: 'rgba(0,0,0,0.2)', padding: '6px 8px', borderRadius: 6 }}>{syncCode}</code>
-                  <button onClick={handleCopySyncCode} className="nav-btn" style={{ padding: '6px 8px', fontSize: 11 }}>Copy</button>
-                </div>
-                <button onClick={handleDisconnectSync} style={{ marginTop: 8, background: 'none', border: 'none', color: '#71717a', fontSize: 10, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
-                  Disconnect this device
-                </button>
-              </div>
-            ) : (
-              <div style={{ display: 'grid', gap: 8 }}>
-                <button onClick={handleGenerateSyncCode} className="nav-btn" style={{ justifyContent: 'center', fontSize: 12 }}>
-                  Set Up Sync
-                </button>
-                <div style={{ display: 'flex', gap: 6 }}>
-                  <input
-                    placeholder="Or paste a code…"
-                    value={syncCodeDraft}
-                    onChange={(e) => setSyncCodeDraft(e.target.value)}
-                    style={{ flex: 1, fontSize: 11, padding: '8px 10px' }}
-                  />
-                  <button onClick={handleConnectSyncCode} className="nav-btn" style={{ fontSize: 11, padding: '8px 10px' }} disabled={!syncCodeDraft.trim()}>
-                    Connect
-                  </button>
-                </div>
-              </div>
-            )}
-            {cloudStatus && (
-              <div style={{
-                marginTop: 8, padding: '8px 12px', borderRadius: 6, fontSize: 11, lineHeight: 1.4,
-                background: cloudStatus.type === 'error' ? 'rgba(239,68,68,0.1)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.04)',
-                color: cloudStatus.type === 'error' ? '#fca5a5' : cloudStatus.type === 'success' ? '#6ee7b7' : '#a1a1aa',
-                border: `1px solid ${cloudStatus.type === 'error' ? 'rgba(239,68,68,0.2)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.2)' : 'rgba(255,255,255,0.06)'}`,
-              }}>
-                {cloudStatus.msg}
-              </div>
-            )}
+            {syncPanel}
           </div>
 
           <div className="sidebar-footer" style={{ marginTop: 'auto', padding: '0 12px', fontSize: 11, color: '#52525b', borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: 16 }}>
             {entry.savedAt ? `Last saved ${new Date(entry.savedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Unsaved'}
           </div>
         </aside>
+
+        {/* Mobile-only Sync entry point — on phones the sidebar (and its Cloud
+            Sync section) becomes a bottom tab bar with only nav buttons, so
+            without this there was no way to reach sync at all on mobile. */}
+        <button
+          className="mobile-sync-btn"
+          onClick={() => setShowSyncModal(true)}
+          aria-label="Cloud Sync"
+          title="Cloud Sync"
+        >
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+            <path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.3-2A5 5 0 0 0 6.5 19h11z" />
+          </svg>
+          {syncCode && <span className="mobile-sync-dot" />}
+        </button>
+
+        {showSyncModal && (
+          <div
+            className="sync-modal-backdrop"
+            onClick={(e) => { if (e.target === e.currentTarget) setShowSyncModal(false); }}
+          >
+            <div className="sync-modal">
+              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
+                <div style={{ fontSize: 13, letterSpacing: '0.06em', textTransform: 'uppercase', color: '#a1a1aa', fontWeight: 600 }}>Cloud Sync</div>
+                <button
+                  onClick={() => setShowSyncModal(false)}
+                  aria-label="Close"
+                  style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 20, lineHeight: 1, cursor: 'pointer', padding: 4 }}
+                >
+                  ×
+                </button>
+              </div>
+              {syncPanel}
+            </div>
+          </div>
+        )}
 
         {/* Main content */}
         <main style={{ flex: 1, minWidth: 0, padding: '40px 36px 80px', maxWidth: 1100 }}>
