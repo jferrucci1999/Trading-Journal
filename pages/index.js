@@ -82,6 +82,80 @@ const buildRoundTripsForDay = (dayTrades) => {
   return trips.sort((a, b) => a.exitTime.localeCompare(b.exitTime));
 };
 
+// --- Optional cloud sync ----------------------------------------------------
+// Off by default — nothing leaves the browser until the user sets up a Sync
+// Code. When one is set, every local save is mirrored to a tiny Supabase
+// table keyed by that code, and the same code entered on another device
+// pulls it back down. There's no login: possession of the code is what
+// grants access, so treat it like a private link, not a password.
+const SUPABASE_URL = 'https://jozvwjvryrvemjnbgiya.supabase.co';
+const SUPABASE_ANON_KEY = 'sb_publishable_HHjjzMwnIox4fnsYiXJI6w_pG-bHqXU';
+const SYNC_CODE_STORAGE_KEY = '__sync_code';
+const SYNC_LAST_PUSH_KEY = '__sync_last_push_at';
+
+const genSyncCode = () => {
+  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
+  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === 'x' ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
+};
+
+// Every local key except our own sync bookkeeping — mirrors what
+// handleExportData already treats as "everything".
+const gatherLocalDataForSync = () => {
+  const data = {};
+  for (let i = 0; i < window.localStorage.length; i++) {
+    const k = window.localStorage.key(i);
+    if (!k || k === SYNC_CODE_STORAGE_KEY || k === SYNC_LAST_PUSH_KEY) continue;
+    const v = window.localStorage.getItem(k);
+    if (v !== null) data[k] = v;
+  }
+  return data;
+};
+
+let cloudPushTimer = null;
+// Debounced so a burst of edits (typing, sliders) doesn't fire a request per keystroke.
+const scheduleCloudPush = () => {
+  if (typeof window === 'undefined') return;
+  const syncCode = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
+  if (!syncCode) return;
+  if (cloudPushTimer) clearTimeout(cloudPushTimer);
+  cloudPushTimer = setTimeout(() => pushToCloud(syncCode), 1500);
+};
+
+const pushToCloud = async (syncCode) => {
+  try {
+    const data = gatherLocalDataForSync();
+    const now = new Date().toISOString();
+    const resp = await fetch(`${SUPABASE_URL}/rest/v1/journal_sync`, {
+      method: 'POST',
+      headers: {
+        apikey: SUPABASE_ANON_KEY,
+        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
+        'Content-Type': 'application/json',
+        Prefer: 'resolution=merge-duplicates',
+      },
+      body: JSON.stringify({ sync_id: syncCode, data, updated_at: now }),
+    });
+    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+    window.localStorage.setItem(SYNC_LAST_PUSH_KEY, now);
+    window.dispatchEvent(new CustomEvent('journal-cloud-sync', { detail: { type: 'success', msg: 'Synced' } }));
+  } catch (e) {
+    window.dispatchEvent(new CustomEvent('journal-cloud-sync', { detail: { type: 'error', msg: 'Sync failed: ' + e.message } }));
+  }
+};
+
+const pullFromCloud = async (syncCode) => {
+  const resp = await fetch(`${SUPABASE_URL}/rest/v1/journal_sync?sync_id=eq.${encodeURIComponent(syncCode)}&select=data,updated_at`, {
+    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
+  });
+  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+  const rows = await resp.json();
+  return rows && rows[0] ? rows[0] : null;
+};
+
 // Real, persistent storage backed by the browser's localStorage.
 // (Earlier versions of this app called a `window.storage` API that only
 // exists inside Claude's artifact preview sandbox — it silently does
@@ -109,10 +183,12 @@ const storage = {
       // Quota exceeded or storage unavailable (e.g. private browsing) — surface it.
       throw new Error(`Could not save to browser storage (${e.message || e}).`);
     }
+    scheduleCloudPush();
   },
   async delete(key) {
     if (typeof window === 'undefined') return;
     window.localStorage.removeItem(key);
+    scheduleCloudPush();
   },
 };
 
@@ -160,6 +236,9 @@ export default function TradingJournal() {
   const [earningsError, setEarningsError] = useState(null);
   const [finnhubKey, setFinnhubKey] = useState('');
   const [earningsSort, setEarningsSort] = useState({ column: null, dir: 'desc' });
+  const [syncCode, setSyncCodeState] = useState('');
+  const [syncCodeDraft, setSyncCodeDraft] = useState('');
+  const [cloudStatus, setCloudStatus] = useState(null);
 
   const handleEarningsFileUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -250,6 +329,38 @@ export default function TradingJournal() {
       }
     };
     load();
+  }, []);
+
+  // Cloud sync: listen for push results from storage.set/delete, and on first
+  // load, pull down anything a paired device saved since we were last here.
+  useEffect(() => {
+    const onCloudSync = (e) => {
+      setCloudStatus(e.detail);
+      if (e.detail.type !== 'loading') {
+        setTimeout(() => setCloudStatus((s) => (s === e.detail ? null : s)), 4000);
+      }
+    };
+    window.addEventListener('journal-cloud-sync', onCloudSync);
+
+    const code = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
+    if (code) {
+      setSyncCodeState(code);
+      (async () => {
+        try {
+          const row = await pullFromCloud(code);
+          const lastPush = window.localStorage.getItem(SYNC_LAST_PUSH_KEY);
+          if (row && row.data && (!lastPush || new Date(row.updated_at) > new Date(lastPush))) {
+            Object.entries(row.data).forEach(([k, v]) => window.localStorage.setItem(k, v));
+            window.localStorage.setItem(SYNC_LAST_PUSH_KEY, row.updated_at);
+            window.location.reload();
+          }
+        } catch (e) {
+          setCloudStatus({ type: 'error', msg: 'Could not reach the sync server.' });
+        }
+      })();
+    }
+
+    return () => window.removeEventListener('journal-cloud-sync', onCloudSync);
   }, []);
 
   useEffect(() => {
@@ -532,6 +643,64 @@ export default function TradingJournal() {
     } catch (err) {
       setSyncStatus({ type: 'error', msg: 'Import failed: ' + err.message });
       setTimeout(() => setSyncStatus(null), 6000);
+    }
+  };
+
+  // Generates a fresh code, saves it on this device, and seeds the cloud with
+  // this device's current data so there's something for a second device to pull.
+  const handleGenerateSyncCode = async () => {
+    const code = genSyncCode();
+    window.localStorage.setItem(SYNC_CODE_STORAGE_KEY, code);
+    setSyncCodeState(code);
+    setCloudStatus({ type: 'loading', msg: 'Setting up…' });
+    try {
+      await pushToCloud(code);
+      setCloudStatus({ type: 'success', msg: 'Sync set up — enter this code on your other device.' });
+    } catch (e) {
+      setCloudStatus({ type: 'error', msg: 'Could not reach the sync server.' });
+    }
+  };
+
+  // Pairs this device to an existing code. If the cloud already has data under
+  // that code, it wins and replaces what's here; otherwise this device's data
+  // becomes the starting point.
+  const handleConnectSyncCode = async () => {
+    const code = syncCodeDraft.trim();
+    if (!code) return;
+    setCloudStatus({ type: 'loading', msg: 'Connecting…' });
+    try {
+      const row = await pullFromCloud(code);
+      window.localStorage.setItem(SYNC_CODE_STORAGE_KEY, code);
+      if (row && row.data) {
+        Object.entries(row.data).forEach(([k, v]) => window.localStorage.setItem(k, v));
+        window.localStorage.setItem(SYNC_LAST_PUSH_KEY, row.updated_at);
+        setCloudStatus({ type: 'success', msg: 'Connected — loading synced data…' });
+        setTimeout(() => window.location.reload(), 1000);
+      } else {
+        await pushToCloud(code);
+        setSyncCodeState(code);
+        setSyncCodeDraft('');
+        setCloudStatus({ type: 'success', msg: "Connected. This device's data is now the synced copy." });
+      }
+    } catch (e) {
+      setCloudStatus({ type: 'error', msg: 'Could not connect: ' + e.message });
+    }
+  };
+
+  // Stops syncing on this device only — the cloud copy (and any other paired device) is untouched.
+  const handleDisconnectSync = () => {
+    window.localStorage.removeItem(SYNC_CODE_STORAGE_KEY);
+    window.localStorage.removeItem(SYNC_LAST_PUSH_KEY);
+    setSyncCodeState('');
+    setCloudStatus(null);
+  };
+
+  const handleCopySyncCode = async () => {
+    try {
+      await navigator.clipboard.writeText(syncCode);
+      setCloudStatus({ type: 'success', msg: 'Code copied.' });
+    } catch (e) {
+      setCloudStatus({ type: 'error', msg: 'Could not copy — select and copy the code manually.' });
     }
   };
 
@@ -933,6 +1102,49 @@ export default function TradingJournal() {
           )}
           <div className="sidebar-extra" style={{ padding: '4px 8px 0', fontSize: 10, color: '#52525b', lineHeight: 1.4 }}>
             Export a backup file here and Import it on another browser/device to sync your data.
+          </div>
+
+          <div className="sidebar-extra" style={{ marginTop: 14, padding: '0 4px' }}>
+            <div style={{ fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#52525b', marginBottom: 8, paddingLeft: 4 }}>Cloud Sync</div>
+            {syncCode ? (
+              <div style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
+                <div style={{ fontSize: 10, color: '#71717a', marginBottom: 6 }}>Enter this code on your other device:</div>
+                <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
+                  <code className="number-font" style={{ flex: 1, fontSize: 11, color: '#93c5fd', wordBreak: 'break-all', background: 'rgba(0,0,0,0.2)', padding: '6px 8px', borderRadius: 6 }}>{syncCode}</code>
+                  <button onClick={handleCopySyncCode} className="nav-btn" style={{ padding: '6px 8px', fontSize: 11 }}>Copy</button>
+                </div>
+                <button onClick={handleDisconnectSync} style={{ marginTop: 8, background: 'none', border: 'none', color: '#71717a', fontSize: 10, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
+                  Disconnect this device
+                </button>
+              </div>
+            ) : (
+              <div style={{ display: 'grid', gap: 8 }}>
+                <button onClick={handleGenerateSyncCode} className="nav-btn" style={{ justifyContent: 'center', fontSize: 12 }}>
+                  Set Up Sync
+                </button>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  <input
+                    placeholder="Or paste a code…"
+                    value={syncCodeDraft}
+                    onChange={(e) => setSyncCodeDraft(e.target.value)}
+                    style={{ flex: 1, fontSize: 11, padding: '8px 10px' }}
+                  />
+                  <button onClick={handleConnectSyncCode} className="nav-btn" style={{ fontSize: 11, padding: '8px 10px' }} disabled={!syncCodeDraft.trim()}>
+                    Connect
+                  </button>
+                </div>
+              </div>
+            )}
+            {cloudStatus && (
+              <div style={{
+                marginTop: 8, padding: '8px 12px', borderRadius: 6, fontSize: 11, lineHeight: 1.4,
+                background: cloudStatus.type === 'error' ? 'rgba(239,68,68,0.1)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.04)',
+                color: cloudStatus.type === 'error' ? '#fca5a5' : cloudStatus.type === 'success' ? '#6ee7b7' : '#a1a1aa',
+                border: `1px solid ${cloudStatus.type === 'error' ? 'rgba(239,68,68,0.2)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.2)' : 'rgba(255,255,255,0.06)'}`,
+              }}>
+                {cloudStatus.msg}
+              </div>
+            )}
           </div>
 
           <div className="sidebar-footer" style={{ marginTop: 'auto', padding: '0 12px', fontSize: 11, color: '#52525b', borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: 16 }}>
