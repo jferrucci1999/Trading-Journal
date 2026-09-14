@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
 import Head from 'next/head';
 import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity } from 'lucide-react';
 
@@ -332,8 +332,25 @@ export default function TradingJournal() {
     load();
   }, []);
 
-  // Cloud sync: listen for push results from storage.set/delete, and on first
-  // load, pull down anything a paired device saved since we were last here.
+  // Refs so the periodic/focus-triggered pull below always sees the latest
+  // state without having to re-subscribe its interval/listeners on every
+  // change (the effect that sets those up only runs once, on mount).
+  const entryRef = useRef(entry);
+  const allEntriesRef = useRef(allEntries);
+  const currentDateRef = useRef(currentDate);
+  useEffect(() => { entryRef.current = entry; }, [entry]);
+  useEffect(() => { allEntriesRef.current = allEntries; }, [allEntries]);
+  useEffect(() => { currentDateRef.current = currentDate; }, [currentDate]);
+
+  // Cloud sync: listen for push results from storage.set/delete, and pull
+  // down anything a paired device saved since we were last here — on load,
+  // periodically while the app is open, and whenever the tab regains focus
+  // (covers coming back to a backgrounded phone browser or PWA). Without the
+  // periodic/focus checks, a device that was already open would only ever
+  // see what existed in the cloud at the moment it first loaded — any entry
+  // saved on the *other* device afterward wouldn't show up until a manual
+  // refresh, which looked like "some things sync, others don't" depending on
+  // what happened to be saved before vs. after that device's tab was opened.
   useEffect(() => {
     const onCloudSync = (e) => {
       setCloudStatus(e.detail);
@@ -343,25 +360,50 @@ export default function TradingJournal() {
     };
     window.addEventListener('journal-cloud-sync', onCloudSync);
 
+    const checkForCloudUpdates = async ({ silent } = {}) => {
+      const code = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
+      if (!code) return;
+      try {
+        const row = await pullFromCloud(code);
+        const lastPush = window.localStorage.getItem(SYNC_LAST_PUSH_KEY);
+        if (row && row.data && (!lastPush || new Date(row.updated_at) > new Date(lastPush))) {
+          // Don't clobber an entry that's mid-edit on this device — if what's
+          // on screen for the current day differs from what was last saved,
+          // wait for the next check (after a save, or a refresh) instead of
+          // reloading out from under the person typing.
+          const savedSnapshot = allEntriesRef.current[currentDateRef.current];
+          const hasUnsavedEdits = JSON.stringify(entryRef.current) !== JSON.stringify(savedSnapshot || null);
+          if (hasUnsavedEdits) {
+            setCloudStatus({ type: 'info', msg: 'New data synced from your other device — save this entry (or refresh) to load it.' });
+            return;
+          }
+          Object.entries(row.data).forEach(([k, v]) => window.localStorage.setItem(k, v));
+          window.localStorage.setItem(SYNC_LAST_PUSH_KEY, row.updated_at);
+          window.location.reload();
+        }
+      } catch (e) {
+        if (!silent) setCloudStatus({ type: 'error', msg: 'Could not reach the sync server.' });
+      }
+    };
+
     const code = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
     if (code) {
       setSyncCodeState(code);
-      (async () => {
-        try {
-          const row = await pullFromCloud(code);
-          const lastPush = window.localStorage.getItem(SYNC_LAST_PUSH_KEY);
-          if (row && row.data && (!lastPush || new Date(row.updated_at) > new Date(lastPush))) {
-            Object.entries(row.data).forEach(([k, v]) => window.localStorage.setItem(k, v));
-            window.localStorage.setItem(SYNC_LAST_PUSH_KEY, row.updated_at);
-            window.location.reload();
-          }
-        } catch (e) {
-          setCloudStatus({ type: 'error', msg: 'Could not reach the sync server.' });
-        }
-      })();
+      checkForCloudUpdates();
     }
 
-    return () => window.removeEventListener('journal-cloud-sync', onCloudSync);
+    const pollId = setInterval(() => checkForCloudUpdates({ silent: true }), 20000);
+    const onFocus = () => checkForCloudUpdates({ silent: true });
+    const onVisibility = () => { if (document.visibilityState === 'visible') checkForCloudUpdates({ silent: true }); };
+    window.addEventListener('focus', onFocus);
+    document.addEventListener('visibilitychange', onVisibility);
+
+    return () => {
+      window.removeEventListener('journal-cloud-sync', onCloudSync);
+      window.removeEventListener('focus', onFocus);
+      document.removeEventListener('visibilitychange', onVisibility);
+      clearInterval(pollId);
+    };
   }, []);
 
   useEffect(() => {
