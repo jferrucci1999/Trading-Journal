@@ -1,6 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import Head from 'next/head';
-import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity } from 'lucide-react';
+import { createClient } from '@supabase/supabase-js';
+import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity, LogOut, Mail, Lock } from 'lucide-react';
 
 const todayKey = () => {
   const d = new Date();
@@ -82,114 +83,99 @@ const buildRoundTripsForDay = (dayTrades) => {
   return trips.sort((a, b) => a.exitTime.localeCompare(b.exitTime));
 };
 
-// --- Optional cloud sync ----------------------------------------------------
-// Off by default — nothing leaves the browser until the user sets up a Sync
-// Code. When one is set, every local save is mirrored to a tiny Supabase
-// table keyed by that code, and the same code entered on another device
-// pulls it back down. There's no login: possession of the code is what
-// grants access, so treat it like a private link, not a password.
+// --- Account + cloud storage -------------------------------------------
+// Entries live in Supabase (table `journal_records`), one row per record,
+// scoped to the signed-in user by Row Level Security — so logging in from
+// any browser sees the same data. A local mirror is kept in localStorage
+// purely as a cache (nothing reads from it directly); Supabase is the
+// source of truth.
 const SUPABASE_URL = 'https://jozvwjvryrvemjnbgiya.supabase.co';
 const SUPABASE_ANON_KEY = 'sb_publishable_HHjjzMwnIox4fnsYiXJI6w_pG-bHqXU';
-const SYNC_CODE_STORAGE_KEY = '__sync_code';
-const SYNC_LAST_PUSH_KEY = '__sync_last_push_at';
 
-const genSyncCode = () => {
-  if (typeof crypto !== 'undefined' && crypto.randomUUID) return crypto.randomUUID();
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, (c) => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
-  });
-};
+export const supabase = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
 
-// Every local key except our own sync bookkeeping — mirrors what
-// handleExportData already treats as "everything".
-const gatherLocalDataForSync = () => {
-  const data = {};
-  for (let i = 0; i < window.localStorage.length; i++) {
-    const k = window.localStorage.key(i);
-    if (!k || k === SYNC_CODE_STORAGE_KEY || k === SYNC_LAST_PUSH_KEY) continue;
-    const v = window.localStorage.getItem(k);
-    if (v !== null) data[k] = v;
-  }
-  return data;
-};
+// Kept in sync with the signed-in user by the auth listener in the app
+// component, so the calls below don't each need an async getUser() round trip.
+let currentUserId = null;
+const setCurrentUserId = (id) => { currentUserId = id; };
 
-let cloudPushTimer = null;
-// Debounced so a burst of edits (typing, sliders) doesn't fire a request per keystroke.
-const scheduleCloudPush = () => {
-  if (typeof window === 'undefined') return;
-  const syncCode = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
-  if (!syncCode) return;
-  if (cloudPushTimer) clearTimeout(cloudPushTimer);
-  cloudPushTimer = setTimeout(() => pushToCloud(syncCode), 1500);
-};
-
-const pushToCloud = async (syncCode) => {
-  try {
-    const data = gatherLocalDataForSync();
-    const now = new Date().toISOString();
-    const resp = await fetch(`${SUPABASE_URL}/rest/v1/journal_sync`, {
-      method: 'POST',
-      headers: {
-        apikey: SUPABASE_ANON_KEY,
-        Authorization: `Bearer ${SUPABASE_ANON_KEY}`,
-        'Content-Type': 'application/json',
-        Prefer: 'resolution=merge-duplicates',
-      },
-      body: JSON.stringify({ sync_id: syncCode, data, updated_at: now }),
-    });
-    if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-    window.localStorage.setItem(SYNC_LAST_PUSH_KEY, now);
-    window.dispatchEvent(new CustomEvent('journal-cloud-sync', { detail: { type: 'success', msg: 'Synced' } }));
-  } catch (e) {
-    window.dispatchEvent(new CustomEvent('journal-cloud-sync', { detail: { type: 'error', msg: 'Sync failed: ' + e.message } }));
-  }
-};
-
-const pullFromCloud = async (syncCode) => {
-  const resp = await fetch(`${SUPABASE_URL}/rest/v1/journal_sync?sync_id=eq.${encodeURIComponent(syncCode)}&select=data,updated_at`, {
-    headers: { apikey: SUPABASE_ANON_KEY, Authorization: `Bearer ${SUPABASE_ANON_KEY}` },
-  });
-  if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
-  const rows = await resp.json();
-  return rows && rows[0] ? rows[0] : null;
-};
-
-// Real, persistent storage backed by the browser's localStorage.
-// (Earlier versions of this app called a `window.storage` API that only
-// exists inside Claude's artifact preview sandbox — it silently does
-// nothing in a real deployed browser, which is why data never saved.)
 const storage = {
   async list(prefix) {
-    if (typeof window === 'undefined') return { keys: [] };
-    const keys = [];
-    for (let i = 0; i < window.localStorage.length; i++) {
-      const k = window.localStorage.key(i);
-      if (k && k.startsWith(prefix)) keys.push(k);
-    }
-    return { keys };
+    if (!currentUserId) return { keys: [] };
+    const { data, error } = await supabase
+      .from('journal_records')
+      .select('record_key')
+      .like('record_key', `${prefix}%`);
+    if (error) throw error;
+    return { keys: (data || []).map((r) => r.record_key) };
   },
   async get(key) {
-    if (typeof window === 'undefined') return null;
-    const v = window.localStorage.getItem(key);
-    return v === null ? null : { value: v };
+    if (!currentUserId) return null;
+    const { data, error } = await supabase
+      .from('journal_records')
+      .select('value')
+      .eq('record_key', key)
+      .maybeSingle();
+    if (error) throw error;
+    return data ? { value: data.value } : null;
   },
   async set(key, value) {
-    if (typeof window === 'undefined') return;
-    try {
-      window.localStorage.setItem(key, value);
-    } catch (e) {
-      // Quota exceeded or storage unavailable (e.g. private browsing) — surface it.
-      throw new Error(`Could not save to browser storage (${e.message || e}).`);
-    }
-    scheduleCloudPush();
+    if (!currentUserId) throw new Error('Not signed in.');
+    const { error } = await supabase
+      .from('journal_records')
+      .upsert(
+        { user_id: currentUserId, record_key: key, value, updated_at: new Date().toISOString() },
+        { onConflict: 'user_id,record_key' }
+      );
+    if (error) throw new Error(`Could not save (${error.message}).`);
+    try { window.localStorage.setItem(key, value); } catch (e) {}
   },
   async delete(key) {
-    if (typeof window === 'undefined') return;
-    window.localStorage.removeItem(key);
-    scheduleCloudPush();
+    if (!currentUserId) return;
+    const { error } = await supabase.from('journal_records').delete().eq('record_key', key);
+    if (error) throw error;
+    try { window.localStorage.removeItem(key); } catch (e) {}
   },
+};
+
+// One-time move of whatever is already in this browser's localStorage into
+// the signed-in account, so entries saved before login aren't stranded.
+// Skips itself once done, and never overwrites an account that already has
+// cloud data (so logging in on a second browser can't clobber the first).
+const migrateLocalDataToAccount = async (userId) => {
+  const flagKey = `__migrated_${userId}`;
+  if (typeof window === 'undefined' || window.localStorage.getItem(flagKey)) return;
+  try {
+    const localKeys = [];
+    for (let i = 0; i < window.localStorage.length; i++) {
+      const k = window.localStorage.key(i);
+      if (k && (k.startsWith('entry:') || k.startsWith('trades:') || k.startsWith('config:') || k.startsWith('recap-'))) {
+        localKeys.push(k);
+      }
+    }
+    if (localKeys.length === 0) {
+      window.localStorage.setItem(flagKey, '1');
+      return;
+    }
+    const { count, error: countErr } = await supabase
+      .from('journal_records')
+      .select('record_key', { count: 'exact', head: true });
+    if (countErr) return; // try again on next load rather than risk data loss
+    if (count && count > 0) {
+      window.localStorage.setItem(flagKey, '1');
+      return;
+    }
+    const rows = localKeys.map((k) => ({
+      user_id: userId,
+      record_key: k,
+      value: window.localStorage.getItem(k),
+      updated_at: new Date().toISOString(),
+    }));
+    const { error } = await supabase.from('journal_records').upsert(rows, { onConflict: 'user_id,record_key' });
+    if (!error) window.localStorage.setItem(flagKey, '1');
+  } catch (e) {
+    // Leave the flag unset so migration is retried on the next load.
+  }
 };
 
 const fmtHoldDuration = (entryT, exitT) => {
@@ -202,6 +188,109 @@ const fmtHoldDuration = (entryT, exitT) => {
   if (sec < 3600) return `${Math.round(sec / 60)}m`;
   return `${(sec / 3600).toFixed(1)}h`;
 };
+
+// Sign in / sign up screen shown whenever there's no active Supabase
+// session. This is the whole point of the account system: log in here from
+// any browser and your journal is the same journal.
+function AuthScreen() {
+  const [mode, setMode] = useState('signin'); // 'signin' | 'signup'
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [message, setMessage] = useState(null);
+
+  const submit = async (e) => {
+    e.preventDefault();
+    if (!email.trim() || !password) return;
+    setBusy(true);
+    setMessage(null);
+    try {
+      if (mode === 'signup') {
+        const { error } = await supabase.auth.signUp({ email: email.trim(), password });
+        if (error) throw error;
+        setMessage({ type: 'success', msg: "Account created — you're signed in." });
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email: email.trim(), password });
+        if (error) throw error;
+      }
+    } catch (err) {
+      setMessage({ type: 'error', msg: err.message || 'Something went wrong.' });
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div style={{ minHeight: '100vh', minHeight: '100dvh', background: 'radial-gradient(ellipse at top, #0f1e3d 0%, #060a14 60%)', color: '#e4e4e7', fontFamily: '"Inter", -apple-system, sans-serif', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20 }}>
+      <Head>
+        <title>Trading Journal</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+      </Head>
+      <style>{`
+        @import url('https://fonts.googleapis.com/css2?family=Instrument+Serif:ital@0;1&family=Inter:wght@300;400;500;600;700&display=swap');
+        html, body { background: #060a14; margin: 0; }
+      `}</style>
+      <form onSubmit={submit} style={{ width: '100%', maxWidth: 380, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)', borderRadius: 16, padding: '32px 28px' }}>
+        <div style={{ fontSize: 12, letterSpacing: '0.2em', textTransform: 'uppercase', color: '#71717a', marginBottom: 6 }}>Trading Journal</div>
+        <h1 style={{ fontFamily: '"Instrument Serif", Georgia, serif', fontSize: 30, fontWeight: 400, margin: '0 0 22px' }}>
+          {mode === 'signup' ? 'Create your account' : 'Welcome back'}
+        </h1>
+
+        <div style={{ display: 'grid', gap: 6, marginBottom: 14 }}>
+          <label style={{ fontSize: 11, color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 6 }}><Mail size={12} /> Email</label>
+          <input
+            type="email"
+            autoComplete="email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            required
+            style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.12)', background: 'rgba(0,0,0,0.25)', color: '#e4e4e7', fontSize: 14 }}
+          />
+        </div>
+
+        <div style={{ display: 'grid', gap: 6, marginBottom: 18 }}>
+          <label style={{ fontSize: 11, color: '#a1a1aa', display: 'flex', alignItems: 'center', gap: 6 }}><Lock size={12} /> Password</label>
+          <input
+            type="password"
+            autoComplete={mode === 'signup' ? 'new-password' : 'current-password'}
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+            required
+            minLength={6}
+            style={{ padding: '10px 12px', borderRadius: 8, border: '1px solid rgba(255,255,255,0.12)', background: 'rgba(0,0,0,0.25)', color: '#e4e4e7', fontSize: 14 }}
+          />
+        </div>
+
+        {message && (
+          <div style={{
+            marginBottom: 14, padding: '8px 12px', borderRadius: 6, fontSize: 12, lineHeight: 1.4,
+            background: message.type === 'error' ? 'rgba(239,68,68,0.1)' : 'rgba(16,185,129,0.1)',
+            color: message.type === 'error' ? '#fca5a5' : '#6ee7b7',
+            border: `1px solid ${message.type === 'error' ? 'rgba(239,68,68,0.2)' : 'rgba(16,185,129,0.2)'}`,
+          }}>
+            {message.msg}
+          </div>
+        )}
+
+        <button
+          type="submit"
+          disabled={busy}
+          style={{ width: '100%', padding: '11px 0', borderRadius: 8, border: 'none', background: 'linear-gradient(135deg, #3b82f6, #2563eb)', color: '#fff', fontWeight: 600, fontSize: 14, cursor: busy ? 'default' : 'pointer', opacity: busy ? 0.7 : 1 }}
+        >
+          {busy ? 'Please wait…' : mode === 'signup' ? 'Sign Up' : 'Log In'}
+        </button>
+
+        <button
+          type="button"
+          onClick={() => { setMode(mode === 'signup' ? 'signin' : 'signup'); setMessage(null); }}
+          style={{ width: '100%', marginTop: 14, background: 'none', border: 'none', color: '#71717a', fontSize: 12, cursor: 'pointer', textDecoration: 'underline' }}
+        >
+          {mode === 'signup' ? 'Already have an account? Log in' : "New here? Create an account"}
+        </button>
+      </form>
+    </div>
+  );
+}
 
 export default function TradingJournal() {
   const [view, setView] = useState('checkin');
@@ -236,10 +325,33 @@ export default function TradingJournal() {
   const [earningsError, setEarningsError] = useState(null);
   const [finnhubKey, setFinnhubKey] = useState('');
   const [earningsSort, setEarningsSort] = useState({ column: null, dir: 'desc' });
-  const [syncCode, setSyncCodeState] = useState('');
-  const [syncCodeDraft, setSyncCodeDraft] = useState('');
-  const [cloudStatus, setCloudStatus] = useState(null);
-  const [showSyncModal, setShowSyncModal] = useState(false);
+  const [session, setSession] = useState(null);
+  const [authLoading, setAuthLoading] = useState(true);
+
+  // Auth: pick up any existing session on load, and keep `session` (and the
+  // module-level currentUserId that storage.* reads) in sync with sign-in/out.
+  useEffect(() => {
+    let active = true;
+    supabase.auth.getSession().then(({ data }) => {
+      if (!active) return;
+      setSession(data.session || null);
+      setCurrentUserId(data.session?.user?.id || null);
+      setAuthLoading(false);
+    });
+    const { data: listener } = supabase.auth.onAuthStateChange((_event, newSession) => {
+      setSession(newSession || null);
+      setCurrentUserId(newSession?.user?.id || null);
+      setAuthLoading(false);
+    });
+    return () => {
+      active = false;
+      listener?.subscription?.unsubscribe();
+    };
+  }, []);
+
+  const handleLogout = async () => {
+    await supabase.auth.signOut();
+  };
 
   const handleEarningsFileUpload = async (e) => {
     const file = e.target.files?.[0];
@@ -284,8 +396,15 @@ export default function TradingJournal() {
   });
 
   useEffect(() => {
+    if (authLoading) return;
+    if (!session) {
+      setLoading(false);
+      return;
+    }
+    setLoading(true);
     const load = async () => {
       try {
+        await migrateLocalDataToAccount(session.user.id);
         const list = await storage.list('entry:');
         if (list && list.keys) {
           const entries = {};
@@ -330,81 +449,9 @@ export default function TradingJournal() {
       }
     };
     load();
-  }, []);
-
-  // Refs so the periodic/focus-triggered pull below always sees the latest
-  // state without having to re-subscribe its interval/listeners on every
-  // change (the effect that sets those up only runs once, on mount).
-  const entryRef = useRef(entry);
-  const allEntriesRef = useRef(allEntries);
-  const currentDateRef = useRef(currentDate);
-  useEffect(() => { entryRef.current = entry; }, [entry]);
-  useEffect(() => { allEntriesRef.current = allEntries; }, [allEntries]);
-  useEffect(() => { currentDateRef.current = currentDate; }, [currentDate]);
-
-  // Cloud sync: listen for push results from storage.set/delete, and pull
-  // down anything a paired device saved since we were last here — on load,
-  // periodically while the app is open, and whenever the tab regains focus
-  // (covers coming back to a backgrounded phone browser or PWA). Without the
-  // periodic/focus checks, a device that was already open would only ever
-  // see what existed in the cloud at the moment it first loaded — any entry
-  // saved on the *other* device afterward wouldn't show up until a manual
-  // refresh, which looked like "some things sync, others don't" depending on
-  // what happened to be saved before vs. after that device's tab was opened.
-  useEffect(() => {
-    const onCloudSync = (e) => {
-      setCloudStatus(e.detail);
-      if (e.detail.type !== 'loading') {
-        setTimeout(() => setCloudStatus((s) => (s === e.detail ? null : s)), 4000);
-      }
-    };
-    window.addEventListener('journal-cloud-sync', onCloudSync);
-
-    const checkForCloudUpdates = async ({ silent } = {}) => {
-      const code = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
-      if (!code) return;
-      try {
-        const row = await pullFromCloud(code);
-        const lastPush = window.localStorage.getItem(SYNC_LAST_PUSH_KEY);
-        if (row && row.data && (!lastPush || new Date(row.updated_at) > new Date(lastPush))) {
-          // Don't clobber an entry that's mid-edit on this device — if what's
-          // on screen for the current day differs from what was last saved,
-          // wait for the next check (after a save, or a refresh) instead of
-          // reloading out from under the person typing.
-          const savedSnapshot = allEntriesRef.current[currentDateRef.current];
-          const hasUnsavedEdits = JSON.stringify(entryRef.current) !== JSON.stringify(savedSnapshot || null);
-          if (hasUnsavedEdits) {
-            setCloudStatus({ type: 'info', msg: 'New data synced from your other device — save this entry (or refresh) to load it.' });
-            return;
-          }
-          Object.entries(row.data).forEach(([k, v]) => window.localStorage.setItem(k, v));
-          window.localStorage.setItem(SYNC_LAST_PUSH_KEY, row.updated_at);
-          window.location.reload();
-        }
-      } catch (e) {
-        if (!silent) setCloudStatus({ type: 'error', msg: 'Could not reach the sync server.' });
-      }
-    };
-
-    const code = window.localStorage.getItem(SYNC_CODE_STORAGE_KEY);
-    if (code) {
-      setSyncCodeState(code);
-      checkForCloudUpdates();
-    }
-
-    const pollId = setInterval(() => checkForCloudUpdates({ silent: true }), 20000);
-    const onFocus = () => checkForCloudUpdates({ silent: true });
-    const onVisibility = () => { if (document.visibilityState === 'visible') checkForCloudUpdates({ silent: true }); };
-    window.addEventListener('focus', onFocus);
-    document.addEventListener('visibilitychange', onVisibility);
-
-    return () => {
-      window.removeEventListener('journal-cloud-sync', onCloudSync);
-      window.removeEventListener('focus', onFocus);
-      document.removeEventListener('visibilitychange', onVisibility);
-      clearInterval(pollId);
-    };
-  }, []);
+    // Re-run when auth finishes or the signed-in user changes — not on every
+    // session object (e.g. a background token refresh keeps the same user.id).
+  }, [authLoading, session?.user?.id]);
 
   useEffect(() => {
     if (view === 'recaps') {
@@ -689,64 +736,6 @@ export default function TradingJournal() {
     }
   };
 
-  // Generates a fresh code, saves it on this device, and seeds the cloud with
-  // this device's current data so there's something for a second device to pull.
-  const handleGenerateSyncCode = async () => {
-    const code = genSyncCode();
-    window.localStorage.setItem(SYNC_CODE_STORAGE_KEY, code);
-    setSyncCodeState(code);
-    setCloudStatus({ type: 'loading', msg: 'Setting up…' });
-    try {
-      await pushToCloud(code);
-      setCloudStatus({ type: 'success', msg: 'Sync set up — enter this code on your other device.' });
-    } catch (e) {
-      setCloudStatus({ type: 'error', msg: 'Could not reach the sync server.' });
-    }
-  };
-
-  // Pairs this device to an existing code. If the cloud already has data under
-  // that code, it wins and replaces what's here; otherwise this device's data
-  // becomes the starting point.
-  const handleConnectSyncCode = async () => {
-    const code = syncCodeDraft.trim();
-    if (!code) return;
-    setCloudStatus({ type: 'loading', msg: 'Connecting…' });
-    try {
-      const row = await pullFromCloud(code);
-      window.localStorage.setItem(SYNC_CODE_STORAGE_KEY, code);
-      if (row && row.data) {
-        Object.entries(row.data).forEach(([k, v]) => window.localStorage.setItem(k, v));
-        window.localStorage.setItem(SYNC_LAST_PUSH_KEY, row.updated_at);
-        setCloudStatus({ type: 'success', msg: 'Connected — loading synced data…' });
-        setTimeout(() => window.location.reload(), 1000);
-      } else {
-        await pushToCloud(code);
-        setSyncCodeState(code);
-        setSyncCodeDraft('');
-        setCloudStatus({ type: 'success', msg: "Connected. This device's data is now the synced copy." });
-      }
-    } catch (e) {
-      setCloudStatus({ type: 'error', msg: 'Could not connect: ' + e.message });
-    }
-  };
-
-  // Stops syncing on this device only — the cloud copy (and any other paired device) is untouched.
-  const handleDisconnectSync = () => {
-    window.localStorage.removeItem(SYNC_CODE_STORAGE_KEY);
-    window.localStorage.removeItem(SYNC_LAST_PUSH_KEY);
-    setSyncCodeState('');
-    setCloudStatus(null);
-  };
-
-  const handleCopySyncCode = async () => {
-    try {
-      await navigator.clipboard.writeText(syncCode);
-      setCloudStatus({ type: 'success', msg: 'Code copied.' });
-    } catch (e) {
-      setCloudStatus({ type: 'error', msg: 'Could not copy — select and copy the code manually.' });
-    }
-  };
-
   const saveEntry = async () => {
     if (!entry) return;
     setSaving(true);
@@ -813,6 +802,22 @@ export default function TradingJournal() {
     setCurrentDate(next);
   };
 
+  if (authLoading) {
+    return (
+      <div style={{ minHeight: '100vh', background: '#0a0b0f', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'Georgia, serif' }}>
+        <Head>
+          <title>Trading Journal</title>
+          <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover" />
+        </Head>
+        <div>Loading…</div>
+      </div>
+    );
+  }
+
+  if (!session) {
+    return <AuthScreen />;
+  }
+
   if (loading || !entry) {
     return (
       <div style={{ minHeight: '100vh', background: '#0a0b0f', color: '#a1a1aa', display: 'flex', alignItems: 'center', justifyContent: 'center', fontFamily: 'Georgia, serif' }}>
@@ -828,52 +833,6 @@ export default function TradingJournal() {
   const score = readiness();
   const isToday = currentDate === todayKey();
   const sortedDates = Object.keys(allEntries).sort().reverse();
-
-  // Shared between the desktop sidebar and the mobile Sync modal so both
-  // stay in sync (pun intended) with a single implementation.
-  const syncPanel = (
-    <>
-      {syncCode ? (
-        <div style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
-          <div style={{ fontSize: 10, color: '#71717a', marginBottom: 6 }}>Enter this code on your other device:</div>
-          <div style={{ display: 'flex', gap: 6, alignItems: 'center' }}>
-            <code className="number-font" style={{ flex: 1, fontSize: 11, color: '#93c5fd', wordBreak: 'break-all', background: 'rgba(0,0,0,0.2)', padding: '6px 8px', borderRadius: 6 }}>{syncCode}</code>
-            <button onClick={handleCopySyncCode} className="nav-btn" style={{ padding: '6px 8px', fontSize: 11 }}>Copy</button>
-          </div>
-          <button onClick={handleDisconnectSync} style={{ marginTop: 8, background: 'none', border: 'none', color: '#71717a', fontSize: 10, cursor: 'pointer', textDecoration: 'underline', padding: 0 }}>
-            Disconnect this device
-          </button>
-        </div>
-      ) : (
-        <div style={{ display: 'grid', gap: 8 }}>
-          <button onClick={handleGenerateSyncCode} className="nav-btn" style={{ justifyContent: 'center', fontSize: 12 }}>
-            Set Up Sync
-          </button>
-          <div style={{ display: 'flex', gap: 6 }}>
-            <input
-              placeholder="Or paste a code…"
-              value={syncCodeDraft}
-              onChange={(e) => setSyncCodeDraft(e.target.value)}
-              style={{ flex: 1, fontSize: 11, padding: '8px 10px' }}
-            />
-            <button onClick={handleConnectSyncCode} className="nav-btn" style={{ fontSize: 11, padding: '8px 10px' }} disabled={!syncCodeDraft.trim()}>
-              Connect
-            </button>
-          </div>
-        </div>
-      )}
-      {cloudStatus && (
-        <div style={{
-          marginTop: 8, padding: '8px 12px', borderRadius: 6, fontSize: 11, lineHeight: 1.4,
-          background: cloudStatus.type === 'error' ? 'rgba(239,68,68,0.1)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.1)' : 'rgba(255,255,255,0.04)',
-          color: cloudStatus.type === 'error' ? '#fca5a5' : cloudStatus.type === 'success' ? '#6ee7b7' : '#a1a1aa',
-          border: `1px solid ${cloudStatus.type === 'error' ? 'rgba(239,68,68,0.2)' : cloudStatus.type === 'success' ? 'rgba(16,185,129,0.2)' : 'rgba(255,255,255,0.06)'}`,
-        }}>
-          {cloudStatus.msg}
-        </div>
-      )}
-    </>
-  );
 
   return (
     <div style={{ minHeight: '100vh', background: 'radial-gradient(ellipse at top, #0f1e3d 0%, #060a14 60%)', color: '#e4e4e7', fontFamily: '"Inter", -apple-system, sans-serif' }}>
@@ -1055,66 +1014,10 @@ export default function TradingJournal() {
           backdrop-filter: blur(10px);
         }
 
-        /* Floating Cloud Sync entry point — desktop already has it in the
-           sidebar, so this stays hidden until the mobile media query below
-           turns it on. */
-        .mobile-sync-btn {
-          display: none;
-        }
-        .sync-modal-backdrop {
-          position: fixed;
-          inset: 0;
-          background: rgba(0,0,0,0.6);
-          backdrop-filter: blur(2px);
-          z-index: 100;
-          display: flex;
-          align-items: flex-end;
-          justify-content: center;
-        }
-        .sync-modal {
-          width: 100%;
-          max-width: 420px;
-          background: #0f1524;
-          border: 1px solid rgba(255,255,255,0.08);
-          border-radius: 16px 16px 0 0;
-          padding: 20px 16px calc(20px + env(safe-area-inset-bottom));
-          box-shadow: 0 -8px 30px rgba(0,0,0,0.4);
-        }
-
         /* Phones/small tablets: sidebar becomes a fixed bottom tab bar so daily
            check-ins are usable one-handed; secondary tools (tlg import, backup
-           export/import) stay desktop-only for now — reachable instead via the
-           floating Cloud Sync button (Export/Import remain desktop-only). */
+           export/import, account) stay desktop-only for now. */
         @media (max-width: 860px) {
-          .mobile-sync-btn {
-            display: flex;
-            align-items: center;
-            justify-content: center;
-            position: fixed;
-            top: calc(14px + env(safe-area-inset-top));
-            right: 14px;
-            width: 40px;
-            height: 40px;
-            border-radius: 999px;
-            background: rgba(15,21,36,0.9);
-            border: 1px solid rgba(255,255,255,0.12);
-            color: #93c5fd;
-            z-index: 60;
-            box-shadow: 0 4px 14px rgba(0,0,0,0.35);
-          }
-          .mobile-sync-dot {
-            position: absolute;
-            top: 6px;
-            right: 6px;
-            width: 8px;
-            height: 8px;
-            border-radius: 999px;
-            background: #34d399;
-            border: 1.5px solid rgba(15,21,36,0.9);
-          }
-          .sync-modal-backdrop {
-            align-items: flex-end;
-          }
           .sidebar {
             position: fixed;
             left: 0; right: 0; bottom: 0; top: auto;
@@ -1250,50 +1153,19 @@ export default function TradingJournal() {
           </div>
 
           <div className="sidebar-extra" style={{ marginTop: 14, padding: '0 4px' }}>
-            <div style={{ fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#52525b', marginBottom: 8, paddingLeft: 4 }}>Cloud Sync</div>
-            {syncPanel}
+            <div style={{ fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase', color: '#52525b', marginBottom: 8, paddingLeft: 4 }}>Account</div>
+            <div style={{ padding: '10px 12px', borderRadius: 8, background: 'rgba(255,255,255,0.03)', border: '1px solid rgba(255,255,255,0.08)' }}>
+              <div style={{ fontSize: 12, color: '#d4d4d8', marginBottom: 8, wordBreak: 'break-all' }}>{session.user.email}</div>
+              <button onClick={handleLogout} className="nav-btn" style={{ width: '100%', justifyContent: 'center', fontSize: 12, gap: 6 }}>
+                <LogOut size={13} /> Log Out
+              </button>
+            </div>
           </div>
 
           <div className="sidebar-footer" style={{ marginTop: 'auto', padding: '0 12px', fontSize: 11, color: '#52525b', borderTop: '1px solid rgba(255,255,255,0.04)', paddingTop: 16 }}>
             {entry.savedAt ? `Last saved ${new Date(entry.savedAt).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' })}` : 'Unsaved'}
           </div>
         </aside>
-
-        {/* Mobile-only Sync entry point — on phones the sidebar (and its Cloud
-            Sync section) becomes a bottom tab bar with only nav buttons, so
-            without this there was no way to reach sync at all on mobile. */}
-        <button
-          className="mobile-sync-btn"
-          onClick={() => setShowSyncModal(true)}
-          aria-label="Cloud Sync"
-          title="Cloud Sync"
-        >
-          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <path d="M17.5 19a4.5 4.5 0 0 0 0-9 6 6 0 0 0-11.3-2A5 5 0 0 0 6.5 19h11z" />
-          </svg>
-          {syncCode && <span className="mobile-sync-dot" />}
-        </button>
-
-        {showSyncModal && (
-          <div
-            className="sync-modal-backdrop"
-            onClick={(e) => { if (e.target === e.currentTarget) setShowSyncModal(false); }}
-          >
-            <div className="sync-modal">
-              <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 14 }}>
-                <div style={{ fontSize: 13, letterSpacing: '0.06em', textTransform: 'uppercase', color: '#a1a1aa', fontWeight: 600 }}>Cloud Sync</div>
-                <button
-                  onClick={() => setShowSyncModal(false)}
-                  aria-label="Close"
-                  style={{ background: 'none', border: 'none', color: '#71717a', fontSize: 20, lineHeight: 1, cursor: 'pointer', padding: 4 }}
-                >
-                  ×
-                </button>
-              </div>
-              {syncPanel}
-            </div>
-          </div>
-        )}
 
         {/* Main content */}
         <main style={{ flex: 1, minWidth: 0, padding: '40px 36px 80px', maxWidth: 1100 }}>
