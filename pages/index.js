@@ -1,7 +1,7 @@
 import React, { useState, useEffect, useRef } from 'react';
 import Head from 'next/head';
 import { createClient } from '@supabase/supabase-js';
-import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity, LogOut, Mail, Lock } from 'lucide-react';
+import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity, LogOut, Mail, Lock, HardDriveDownload } from 'lucide-react';
 
 const todayKey = () => {
   const d = new Date();
@@ -742,6 +742,77 @@ export default function TradingJournal() {
     }
   };
 
+  // One-time cleanup for entries saved before screenshots moved to Storage:
+  // finds any screenshot still holding legacy inline base64 (`data`, no `url`),
+  // uploads it to the "screenshots" bucket, and rewrites the entry to hold
+  // just the {url, path} reference. Safe to re-run — only touches shots that
+  // still have `data` and no `url`, so a partial failure just gets retried
+  // next time without redoing already-migrated ones or duplicating uploads.
+  const handleMigrateScreenshots = async () => {
+    const userId = session?.user?.id;
+    if (!userId) return;
+    if (!window.confirm('This rewrites older entries to move their screenshots out of the database and into storage. It can take a while for a lot of entries. Continue?')) return;
+    setSyncStatus({ type: 'loading', msg: 'Scanning entries for legacy screenshots…' });
+    let entriesScanned = 0, entriesMigrated = 0, shotsMigrated = 0, bytesFreed = 0, failures = 0;
+    try {
+      const { keys } = await storage.list('entry:');
+      for (const key of keys) {
+        entriesScanned++;
+        let r;
+        try { r = await storage.get(key); } catch (e) { failures++; continue; }
+        if (!r) continue;
+        let parsed;
+        try { parsed = JSON.parse(r.value); } catch (e) { failures++; continue; }
+        const shots = parsed.screenshots || [];
+        if (!shots.some(s => s.data && !s.url)) continue;
+
+        const dateKey = key.replace('entry:', '');
+        const newShots = [];
+        let changed = false;
+        for (const s of shots) {
+          if (!s.data || s.url) { newShots.push(s); continue; }
+          try {
+            bytesFreed += s.data.length;
+            const res = await fetch(s.data);
+            const blob = await res.blob();
+            const ext = (blob.type.split('/')[1] || 'png').split('+')[0];
+            const safeName = (s.name || `screenshot.${ext}`).replace(/[^a-zA-Z0-9._-]/g, '_');
+            const path = `${userId}/${dateKey}/${s.id}-${safeName}`;
+            const { error: upErr } = await supabase.storage.from('screenshots').upload(path, blob, { contentType: blob.type, upsert: true });
+            if (upErr) throw upErr;
+            const { data: pub } = supabase.storage.from('screenshots').getPublicUrl(path);
+            newShots.push({ id: s.id, url: pub.publicUrl, path, name: s.name });
+            shotsMigrated++;
+            changed = true;
+          } catch (e) {
+            newShots.push(s); // leave this one as legacy data; will retry next run
+            failures++;
+          }
+        }
+        if (changed) {
+          const toSave = { ...parsed, screenshots: newShots };
+          try {
+            await storage.set(key, JSON.stringify(toSave));
+            entriesMigrated++;
+            setAllEntries(prev => (prev[dateKey] ? { ...prev, [dateKey]: toSave } : prev));
+            if (dateKey === currentDate) setEntry(toSave);
+          } catch (e) { failures++; }
+        }
+      }
+      const mb = (bytesFreed / (1024 * 1024)).toFixed(1);
+      setSyncStatus({
+        type: failures > 0 ? 'error' : 'success',
+        msg: entriesMigrated > 0
+          ? `Migrated ${shotsMigrated} screenshot${shotsMigrated === 1 ? '' : 's'} across ${entriesMigrated} ${entriesMigrated === 1 ? 'entry' : 'entries'} (~${mb}MB out of the database)${failures ? `. ${failures} item(s) failed — safe to run again.` : '.'}`
+          : `No legacy screenshots found in ${entriesScanned} entries. Nothing to migrate.`,
+      });
+      setTimeout(() => setSyncStatus(null), 12000);
+    } catch (err) {
+      setSyncStatus({ type: 'error', msg: 'Migration failed: ' + err.message + ' — safe to run again.' });
+      setTimeout(() => setSyncStatus(null), 10000);
+    }
+  };
+
   // Import a JSON backup produced by handleExportData — restores/overwrites matching
   // records, then reloads so every view picks up the fresh data.
   const handleImportDataFile = async (e) => {
@@ -1181,6 +1252,15 @@ export default function TradingJournal() {
           )}
           <div className="sidebar-extra" style={{ padding: '4px 8px 0', fontSize: 10, color: '#52525b', lineHeight: 1.4 }}>
             Export a backup file here and Import it on another browser/device to sync your data.
+          </div>
+
+          <div className="sidebar-extra" style={{ marginTop: 10, padding: '0 4px' }}>
+            <button onClick={handleMigrateScreenshots} className="nav-btn" style={{ width: '100%', justifyContent: 'center', fontSize: 12, padding: '8px 10px', gap: 6 }}>
+              <HardDriveDownload size={13} /> Clean up old screenshots
+            </button>
+            <div style={{ padding: '4px 4px 0', fontSize: 10, color: '#52525b', lineHeight: 1.4 }}>
+              One-time: moves screenshots saved before storage sync out of the database. Safe to run more than once.
+            </div>
           </div>
 
           <div className="sidebar-extra" style={{ marginTop: 14, padding: '0 4px' }}>
