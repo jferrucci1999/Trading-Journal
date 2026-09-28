@@ -785,6 +785,7 @@ export default function TradingJournal() {
             shotsMigrated++;
             changed = true;
           } catch (e) {
+            console.error('Screenshot migration failed for', s.id, e); // eslint-disable-line no-console
             newShots.push(s); // leave this one as legacy data; will retry next run
             failures++;
           }
@@ -800,12 +801,15 @@ export default function TradingJournal() {
         }
       }
       const mb = (bytesFreed / (1024 * 1024)).toFixed(1);
-      setSyncStatus({
-        type: failures > 0 ? 'error' : 'success',
-        msg: entriesMigrated > 0
-          ? `Migrated ${shotsMigrated} screenshot${shotsMigrated === 1 ? '' : 's'} across ${entriesMigrated} ${entriesMigrated === 1 ? 'entry' : 'entries'} (~${mb}MB out of the database)${failures ? `. ${failures} item(s) failed — safe to run again.` : '.'}`
-          : `No legacy screenshots found in ${entriesScanned} entries. Nothing to migrate.`,
-      });
+      let msg;
+      if (entriesMigrated > 0) {
+        msg = `Migrated ${shotsMigrated} screenshot${shotsMigrated === 1 ? '' : 's'} across ${entriesMigrated} ${entriesMigrated === 1 ? 'entry' : 'entries'} (~${mb}MB out of the database)${failures ? `. ${failures} item(s) failed — safe to run again.` : '.'}`;
+      } else if (failures > 0) {
+        msg = `Found legacy screenshots but couldn't migrate any — ${failures} item(s) failed (e.g. a missing storage bucket or permissions issue). Safe to run again once that's fixed.`;
+      } else {
+        msg = `No legacy screenshots found in ${entriesScanned} entries. Nothing to migrate.`;
+      }
+      setSyncStatus({ type: failures > 0 ? 'error' : 'success', msg });
       setTimeout(() => setSyncStatus(null), 12000);
     } catch (err) {
       setSyncStatus({ type: 'error', msg: 'Migration failed: ' + err.message + ' — safe to run again.' });
