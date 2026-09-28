@@ -482,25 +482,56 @@ export default function TradingJournal() {
     }
   }, [currentDate]);
 
+  // Screenshots are uploaded to the Supabase Storage bucket "screenshots"
+  // and only a {id, url, path, name} reference is kept in the entry's JSON.
+  // Older entries may still hold a legacy inline {id, data, name} (base64) —
+  // those still render (see the `data:` fallback below) but are no longer
+  // created. Storing images out-of-row keeps every entry's JSON small, so
+  // the bulk `storage.get` loop that loads all entries on app start (see the
+  // `[authLoading, session?.user?.id]` effect above) doesn't re-download
+  // megabytes of image data on every load.
   const handleScreenshotUpload = (e) => {
     const files = Array.from(e.target.files || []);
-    files.forEach(file => {
+    const userId = session?.user?.id;
+    files.forEach(async (file) => {
       if (!file.type.startsWith('image/')) return;
       if (file.size > 2 * 1024 * 1024) {
         alert(`${file.name} is too large. Max 2MB per image.`);
         return;
       }
-      const reader = new FileReader();
-      reader.onload = (ev) => {
-        setEntry(prev => ({ ...prev, screenshots: [...(prev.screenshots || []), { id: Date.now() + Math.random(), data: ev.target.result, name: file.name }] }));
-      };
-      reader.readAsDataURL(file);
+      if (!userId) {
+        alert('Not signed in — cannot upload.');
+        return;
+      }
+      const id = Date.now() + Math.random();
+      const safeName = file.name.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const path = `${userId}/${currentDate}/${id}-${safeName}`;
+      try {
+        const { error: uploadErr } = await supabase.storage
+          .from('screenshots')
+          .upload(path, file, { contentType: file.type, upsert: false });
+        if (uploadErr) throw uploadErr;
+        const { data: pub } = supabase.storage.from('screenshots').getPublicUrl(path);
+        setEntry(prev => ({
+          ...prev,
+          screenshots: [...(prev.screenshots || []), { id, url: pub.publicUrl, path, name: file.name }],
+        }));
+      } catch (err) {
+        alert(`Could not upload ${file.name}: ${err.message}`);
+      }
     });
     e.target.value = '';
   };
 
   const removeScreenshot = (id) => {
-    setEntry(prev => ({ ...prev, screenshots: (prev.screenshots || []).filter(s => s.id !== id) }));
+    setEntry(prev => {
+      const target = (prev.screenshots || []).find(s => s.id === id);
+      // Best-effort delete from storage; don't block the UI update on it.
+      if (target?.path) {
+        supabase.storage.from('screenshots').remove([target.path]).catch(() => {});
+      }
+      return { ...prev, screenshots: (prev.screenshots || []).filter(s => s.id !== id) };
+    });
   };
 
   // Tolerant numeric parser: handles thousands separators and (123.45)-style negatives.
@@ -1382,7 +1413,7 @@ export default function TradingJournal() {
                   <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 10 }}>
                     {entry.screenshots.map(s => (
                       <div key={s.id} style={{ position: 'relative', aspectRatio: '16/10', borderRadius: 8, overflow: 'hidden', background: 'rgba(0,0,0,0.3)', border: '1px solid rgba(255,255,255,0.06)' }}>
-                        <img src={s.data} alt={s.name} style={{ width: '100%', height: '100%', objectFit: 'cover', cursor: 'pointer' }} onClick={() => window.open(s.data, '_blank')} />
+                        <img src={s.url || s.data} alt={s.name} style={{ width: '100%', height: '100%', objectFit: 'cover', cursor: 'pointer' }} onClick={() => window.open(s.url || s.data, '_blank')} />
                         <button onClick={() => removeScreenshot(s.id)}
                           style={{ position: 'absolute', top: 4, right: 4, width: 22, height: 22, borderRadius: '50%', background: 'rgba(0,0,0,0.7)', border: 'none', color: '#fff', cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
                           <X size={12} />
