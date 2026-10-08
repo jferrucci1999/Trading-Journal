@@ -36,6 +36,15 @@ All entries save locally in your browser (localStorage) — nothing is sent to a
 Since it's local to one browser, use the **Export/Import** buttons in the sidebar to
 move your data to another browser or device, or as a backup.
 
+### Trade import & P&L (.tlg)
+
+- Import one or more Interactive Brokers `.tlg` files from the sidebar. Import them in any order; re-importing a file is safe.
+- **P&L is computed by FIFO-pairing buys and sells.** The `.tlg` *Proceeds* column is not profit and loss (it is positive for buys and negative for sells), so it is never summed directly.
+- **Day trades vs. swings.** A round trip opened and closed the same day is a *day trade*. Closing a position carried in from an earlier day is a *swing*. The cost basis for carried positions comes from the open-positions section of the previous day's file, which is why each import also stores that snapshot. A day's P&L is day + swing; the split is shown in the journal, the trades view and the analytics filter.
+- A close of a position opened before your earliest imported file has no cost basis. It is listed and excluded from P&L until you import the earlier day.
+- Auto-filled day P&L is refreshed on every import. A P&L you type in by hand is never overwritten.
+- Engine: `lib/pnl.js`. Tests: `node --test lib/pnl.test.mjs`.
+
 ## Features
 
 ### Morning Check-in

@@ -1,6 +1,7 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Head from 'next/head';
 import { createClient } from '@supabase/supabase-js';
+import { buildLedger, parsePositionLots, legacyDayPnl } from '../lib/pnl';
 import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity, LogOut, Mail, Lock, HardDriveDownload } from 'lucide-react';
 
 const todayKey = () => {
@@ -37,50 +38,32 @@ const MOODS = [
   { id: 'tough', label: 'Tough', emoji: '🌧️' },
 ];
 
-// FIFO round-trip pairing for a single day's trades
-const buildRoundTripsForDay = (dayTrades) => {
-  const trips = [];
-  const bySymbol = {};
-  dayTrades.forEach(t => {
-    if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
-    bySymbol[t.symbol].push(t);
+// Refresh each imported day's journal P&L from the trade ledger.
+// A day's P&L is overwritten only when it was auto-filled from a trade import
+// (pnlSource === 'tlg'), is empty, or matches what the old importer would have
+// written (that importer inverted the sign). A number typed in by hand is kept.
+// With legacyOnly (used at load time) empty days are not created.
+const recalcEntryPnl = (entries, trades, ledger, { legacyOnly = false, blank = null } = {}) => {
+  const next = { ...entries };
+  const changed = [];
+  Object.keys(trades).forEach((date) => {
+    const day = ledger.byDate[date];
+    if (!day || !trades[date] || trades[date].length === 0) return;
+    const e = next[date];
+    if (!e && (legacyOnly || !blank)) return;
+    const cur = e ? e.pnl : '';
+    const isEmpty = cur === '' || cur == null;
+    const wasAuto = !!(e && e.pnlSource === 'tlg');
+    const legacy = legacyDayPnl(trades[date]);
+    const looksLegacy = !isEmpty && Math.abs(parseFloat(cur) - legacy) < 0.006;
+    const mayOverwrite = wasAuto || looksLegacy || (!legacyOnly && isEmpty);
+    if (!mayOverwrite) return;
+    const corrected = day.total.toFixed(2);
+    if (wasAuto && !isEmpty && Math.abs(parseFloat(cur) - day.total) < 0.006) return;
+    next[date] = { ...(e || blank()), pnl: corrected, pnlSource: 'tlg', savedAt: new Date().toISOString() };
+    changed.push(date);
   });
-  Object.entries(bySymbol).forEach(([symbol, trades]) => {
-    const sorted = [...trades].sort((a, b) => a.time.localeCompare(b.time));
-    const longQueue = [];
-    const shortQueue = [];
-    sorted.forEach(t => {
-      let qty = Math.abs(t.qty);
-      const isBuy = t.qty > 0;
-      const price = t.price;
-      const time = t.time;
-      const commPerShare = qty > 0 ? t.commission / qty : 0;
-      if (isBuy) {
-        while (qty > 0 && shortQueue.length > 0) {
-          const s = shortQueue[0];
-          const closeQty = Math.min(qty, s.qty);
-          const pnl = (s.price - price) * closeQty + (s.commission * (closeQty / s.origQty)) + commPerShare * closeQty;
-          trips.push({ symbol, side: 'short', entryTime: s.time, exitTime: time, qty: closeQty, entryPrice: s.price, exitPrice: price, pnl });
-          s.qty -= closeQty;
-          qty -= closeQty;
-          if (s.qty <= 0.0001) shortQueue.shift();
-        }
-        if (qty > 0) longQueue.push({ qty, origQty: qty, price, time, commission: commPerShare * qty });
-      } else {
-        while (qty > 0 && longQueue.length > 0) {
-          const l = longQueue[0];
-          const closeQty = Math.min(qty, l.qty);
-          const pnl = (price - l.price) * closeQty + (l.commission * (closeQty / l.origQty)) + commPerShare * closeQty;
-          trips.push({ symbol, side: 'long', entryTime: l.time, exitTime: time, qty: closeQty, entryPrice: l.price, exitPrice: price, pnl });
-          l.qty -= closeQty;
-          qty -= closeQty;
-          if (l.qty <= 0.0001) longQueue.shift();
-        }
-        if (qty > 0) shortQueue.push({ qty, origQty: qty, price, time, commission: commPerShare * qty });
-      }
-    });
-  });
-  return trips.sort((a, b) => a.exitTime.localeCompare(b.exitTime));
+  return { entries: next, changed };
 };
 
 // --- Account + cloud storage -------------------------------------------
@@ -179,6 +162,7 @@ const migrateLocalDataToAccount = async (userId) => {
 };
 
 const fmtHoldDuration = (entryT, exitT) => {
+  if (!/^\d{1,2}:\d{2}/.test(entryT || '')) return 'overnight';
   const t2s = (t) => {
     const [h, m, s] = t.split(':').map(Number);
     return h * 3600 + m * 60 + (s || 0);
@@ -314,6 +298,8 @@ export default function TradingJournal() {
   const [entry, setEntry] = useState(null);
   const [allEntries, setAllEntries] = useState({});
   const [allTrades, setAllTrades] = useState({}); // keyed by date
+  const [allPositions, setAllPositions] = useState({}); // end-of-day open-lot snapshots, keyed by date
+  const [tripKind, setTripKind] = useState('all'); // analytics filter: 'all' | 'day' | 'swing'
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -327,6 +313,10 @@ export default function TradingJournal() {
   const [earningsSort, setEarningsSort] = useState({ column: null, dir: 'desc' });
   const [session, setSession] = useState(null);
   const [authLoading, setAuthLoading] = useState(true);
+
+  // Realized P&L for every imported day, with each round trip tagged 'day'
+  // (opened and closed same day) or 'swing' (closed a position carried in).
+  const ledger = useMemo(() => buildLedger(allTrades, allPositions), [allTrades, allPositions]);
 
   // Auth: pick up any existing session on load, and keep `session` (and the
   // module-level currentUserId that storage.* reads) in sync with sign-in/out.
@@ -406,36 +396,55 @@ export default function TradingJournal() {
       try {
         await migrateLocalDataToAccount(session.user.id);
         const list = await storage.list('entry:');
+        let entries = {};
         if (list && list.keys) {
-          const entries = {};
           for (const key of list.keys) {
             try {
               const r = await storage.get(key);
               if (r) entries[key.replace('entry:', '')] = JSON.parse(r.value);
             } catch (e) {}
           }
-          setAllEntries(entries);
-          if (entries[currentDate]) {
-            setEntry(entries[currentDate]);
-          } else {
-            setEntry(blankEntry());
-          }
-        } else {
-          setEntry(blankEntry());
         }
 
         // Load trades
+        const trades = {};
         const tradeList = await storage.list('trades:');
         if (tradeList && tradeList.keys) {
-          const trades = {};
           for (const key of tradeList.keys) {
             try {
               const r = await storage.get(key);
               if (r) trades[key.replace('trades:', '')] = JSON.parse(r.value);
             } catch (e) {}
           }
-          setAllTrades(trades);
         }
+
+        // Load end-of-day position snapshots (cost basis for positions held overnight)
+        const positions = {};
+        const posList = await storage.list('positions:');
+        if (posList && posList.keys) {
+          for (const key of posList.keys) {
+            try {
+              const r = await storage.get(key);
+              if (r) positions[key.replace('positions:', '')] = JSON.parse(r.value);
+            } catch (e) {}
+          }
+        }
+
+        // Earlier versions auto-filled each day's P&L from the raw Proceeds column,
+        // which inverts the sign. Replace those auto-filled values (and only those —
+        // anything typed by hand is left alone) with the corrected figure.
+        if (Object.keys(trades).length > 0) {
+          const fixed = recalcEntryPnl(entries, trades, buildLedger(trades, positions), { legacyOnly: true });
+          for (const date of fixed.changed) {
+            try { await storage.set(`entry:${date}`, JSON.stringify(fixed.entries[date])); } catch (e) {}
+          }
+          entries = fixed.entries;
+        }
+
+        setAllEntries(entries);
+        setEntry(entries[currentDate] || blankEntry());
+        setAllTrades(trades);
+        setAllPositions(positions);
 
         // Load Finnhub API key
         try {
@@ -551,7 +560,7 @@ export default function TradingJournal() {
   // Format: STK_TRD|TradeID|Symbol|Description|Exchange|Side|Codes|YYYYMMDD|HH:MM:SS|Currency|Quantity|Multiplier|Price|Proceeds|Commission|FXRate
   // Note: single-currency (USD) accounts often omit the trailing FXRate column, so we
   // only require fields through Commission (index 14), not the full 16.
-  const parseTlg = (text) => {
+  const parseTlg = (text, fileName) => {
     const clean = (text || '').replace(/^﻿/, ''); // strip BOM if present
     const rawLines = clean.split(/\r?\n/);
     const trades = [];
@@ -590,39 +599,26 @@ export default function TradingJournal() {
         date: dateKey,
         time,
         currency: f[9],
+        codes: (f[6] || '').trim(),
         qty: parseNum(f[10]),
+        multiplier: parseNum(f[11]) || (upper.startsWith('OPT_TRD') ? 100 : 1),
         price: parseNum(f[12]),
         proceeds: parseNum(f[13]),
         commission: parseNum(f[14]),
         instrument: upper.startsWith('OPT_TRD') ? 'option' : 'stock',
       });
     }
-    return { trades, diag };
-  };
-
-  // Compute realized P&L by symbol for a given trade list (only fully closed positions)
-  const computeRealizedPnl = (trades) => {
-    const bySymbol = {};
-    trades.forEach(t => {
-      if (!bySymbol[t.symbol]) bySymbol[t.symbol] = { qty: 0, pnl: 0, trades: [] };
-      bySymbol[t.symbol].qty += t.qty;
-      bySymbol[t.symbol].pnl += t.proceeds + t.commission;
-      bySymbol[t.symbol].trades.push(t);
-    });
-    let realized = 0;
-    let unrealized = 0;
-    const symbolPnl = {};
-    Object.entries(bySymbol).forEach(([sym, data]) => {
-      // Round to 2 decimals to handle float drift
-      if (Math.abs(data.qty) < 0.01) {
-        realized += data.pnl;
-        symbolPnl[sym] = { pnl: data.pnl, status: 'closed', trades: data.trades.length };
-      } else {
-        unrealized += data.pnl;
-        symbolPnl[sym] = { pnl: data.pnl, status: 'open', qty: data.qty, trades: data.trades.length };
-      }
-    });
-    return { realized, unrealized, symbolPnl, bySymbol };
+    // End-of-day open lots (STOCK_POSITIONS / OPTION_POSITIONS). These carry the
+    // cost basis needed to price a position that is closed on a later day.
+    // Snapshot date = the day the file's trades are from, else the date in the file name.
+    const dateCounts = {};
+    trades.forEach(t => { dateCounts[t.date] = (dateCounts[t.date] || 0) + 1; });
+    let fileDate = Object.keys(dateCounts).sort((a, b) => dateCounts[b] - dateCounts[a])[0] || null;
+    if (!fileDate) {
+      const m = (fileName || '').match(/(\d{4})(\d{2})(\d{2})/);
+      if (m) fileDate = `${m[1]}-${m[2]}-${m[3]}`;
+    }
+    return { trades, diag, fileDate, lots: parsePositionLots(clean) };
   };
 
   const handleTlgImport = async (e) => {
@@ -635,11 +631,13 @@ export default function TradingJournal() {
     try {
       const allParsed = [];
       const diags = [];
+      const snapshots = {}; // date -> { lots } from each file's open-positions section
       for (const file of files) {
         const text = await file.text();
-        const { trades, diag } = parseTlg(text);
+        const { trades, diag, fileDate, lots } = parseTlg(text, file.name);
         allParsed.push(...trades);
         diags.push(diag);
+        if (fileDate && (lots.length > 0 || trades.length > 0)) snapshots[fileDate] = { lots };
       }
 
       if (allParsed.length === 0) {
@@ -666,47 +664,56 @@ export default function TradingJournal() {
         byDate[t.date].push(t);
       });
 
-      // Merge with existing trades, dedupe by trade id
+      // Merge with existing trades by trade id. A re-imported fill replaces the stored
+      // copy, so older imports pick up fields they were saved without (order codes,
+      // multiplier) instead of being skipped as duplicates.
       const updatedTrades = { ...allTrades };
       let newCount = 0;
       for (const [date, newTrades] of Object.entries(byDate)) {
         const existing = updatedTrades[date] || [];
         const existingIds = new Set(existing.map(t => t.id));
-        const fresh = newTrades.filter(t => !existingIds.has(t.id));
-        newCount += fresh.length;
-        updatedTrades[date] = [...existing, ...fresh].sort((a, b) => a.time.localeCompare(b.time));
+        newCount += newTrades.filter(t => !existingIds.has(t.id)).length;
+        const incomingIds = new Set(newTrades.map(t => t.id));
+        updatedTrades[date] = [...existing.filter(t => !incomingIds.has(t.id)), ...newTrades]
+          .sort((a, b) => a.time.localeCompare(b.time));
       }
 
-      // Save trades to storage
+      // Save trades + position snapshots
       for (const date of Object.keys(byDate)) {
         await storage.set(`trades:${date}`, JSON.stringify(updatedTrades[date]));
       }
+      const updatedPositions = { ...allPositions };
+      for (const [date, snap] of Object.entries(snapshots)) {
+        updatedPositions[date] = snap;
+        await storage.set(`positions:${date}`, JSON.stringify(snap));
+      }
       setAllTrades(updatedTrades);
+      setAllPositions(updatedPositions);
 
-      // Auto-fill journal P&L for each affected date
-      const updatedEntries = { ...allEntries };
-      for (const date of Object.keys(byDate)) {
-        const dayTrades = updatedTrades[date];
-        const { realized } = computeRealizedPnl(dayTrades);
-        const dayEntry = updatedEntries[date] || blankEntry();
-        // Only overwrite if pnl is empty (don't clobber manual entries)
-        if (dayEntry.pnl === '' || dayEntry.pnl == null) {
-          dayEntry.pnl = realized.toFixed(2);
-          dayEntry.savedAt = new Date().toISOString();
-          updatedEntries[date] = dayEntry;
-          await storage.set(`entry:${date}`, JSON.stringify(dayEntry));
-        }
+      // Refresh the journal P&L for every imported day. This covers all dates, not just
+      // the ones in this batch: importing an earlier day can supply the cost basis for a
+      // position that was closed on a later day.
+      const nextLedger = buildLedger(updatedTrades, updatedPositions);
+      const { entries: updatedEntries, changed } = recalcEntryPnl(allEntries, updatedTrades, nextLedger, { blank: blankEntry });
+      for (const date of changed) {
+        await storage.set(`entry:${date}`, JSON.stringify(updatedEntries[date]));
       }
       setAllEntries(updatedEntries);
       if (updatedEntries[currentDate]) setEntry(updatedEntries[currentDate]);
 
+      const unknownCloses = nextLedger.unknown.length;
+      const dayCount = Object.keys(byDate).length;
+      const parts = [];
+      if (newCount > 0) parts.push(`Imported ${newCount} new trade${newCount === 1 ? '' : 's'} across ${dayCount} ${dayCount === 1 ? 'day' : 'days'}.`);
+      else parts.push(`All ${allParsed.length} trade${allParsed.length === 1 ? ' was' : 's were'} already imported.`);
+      if (changed.length > 0) parts.push(`Recalculated P&L for ${changed.length} ${changed.length === 1 ? 'day' : 'days'}.`);
+      if (unknownCloses > 0) parts.push(`${unknownCloses} close${unknownCloses === 1 ? '' : 's'} of positions opened before your earliest file have no cost basis yet — import that earlier day to include them.`);
+
       setImportStatus({
-        type: newCount === 0 ? 'error' : 'success',
-        msg: newCount === 0
-          ? `Found ${allParsed.length} trade${allParsed.length === 1 ? '' : 's'} but all were already imported (0 new).`
-          : `Imported ${newCount} new trade${newCount === 1 ? '' : 's'} across ${Object.keys(byDate).length} ${Object.keys(byDate).length === 1 ? 'day' : 'days'}.`,
+        type: newCount === 0 && changed.length === 0 && Object.keys(snapshots).length === 0 ? 'error' : 'success',
+        msg: parts.join(' '),
       });
-      setTimeout(() => setImportStatus(null), 6000);
+      setTimeout(() => setImportStatus(null), unknownCloses > 0 ? 12000 : 6000);
     } catch (err) {
       setImportStatus({ type: 'error', msg: 'Import failed: ' + err.message });
       setTimeout(() => setImportStatus(null), 4000);
@@ -1411,14 +1418,38 @@ export default function TradingJournal() {
             <div style={{ display: 'grid', gap: 20 }}>
               <div className="card">
                 <div style={{ fontSize: 12, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#71717a', marginBottom: 12 }}>P&L ($)</div>
-                <input type="number" placeholder="0.00" value={entry.pnl} onChange={(e) => setEntry({ ...entry, pnl: e.target.value })}
+                <input type="number" placeholder="0.00" value={entry.pnl} onChange={(e) => setEntry({ ...entry, pnl: e.target.value, pnlSource: 'manual' })}
                   className="number-font"
                   style={{ fontSize: 18, fontWeight: 500 }} />
                 {entry.pnl !== '' && !isNaN(parseFloat(entry.pnl)) && (
                   <div className="number-font" style={{ fontSize: 34, fontWeight: 600, marginTop: 12, color: parseFloat(entry.pnl) >= 0 ? '#10b981' : '#ef4444' }}>
-                    {parseFloat(entry.pnl) >= 0 ? '+' : ''}${Math.abs(parseFloat(entry.pnl)).toFixed(2)}
+                    {parseFloat(entry.pnl) >= 0 ? '+' : '−'}${Math.abs(parseFloat(entry.pnl)).toFixed(2)}
                   </div>
                 )}
+                {entry.pnlSource === 'tlg' && ledger.byDate[currentDate] && (() => {
+                  const d = ledger.byDate[currentDate];
+                  const money = (v) => `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`;
+                  const hasSwing = d.trips.some(t => t.kind === 'swing');
+                  return (
+                    <div style={{ marginTop: 10, display: 'grid', gap: 4, fontSize: 12 }}>
+                      <div style={{ display: 'flex', justifyContent: 'space-between', color: '#a1a1aa' }}>
+                        <span>Day trades</span>
+                        <span className="number-font" style={{ color: d.day >= 0 ? '#10b981' : '#ef4444' }}>{money(d.day)}</span>
+                      </div>
+                      {hasSwing && (
+                        <div style={{ display: 'flex', justifyContent: 'space-between', color: '#a1a1aa' }}>
+                          <span>Swings <span style={{ color: '#52525b' }}>(held overnight)</span></span>
+                          <span className="number-font" style={{ color: d.swing >= 0 ? '#10b981' : '#ef4444' }}>{money(d.swing)}</span>
+                        </div>
+                      )}
+                      {d.unknown.length > 0 && (
+                        <div style={{ color: '#f59e0b', fontSize: 11, marginTop: 2 }}>
+                          {d.unknown.length} close{d.unknown.length === 1 ? '' : 's'} of older positions not counted (no cost basis — import the earlier day).
+                        </div>
+                      )}
+                    </div>
+                  );
+                })()}
               </div>
 
               <div className="card">
@@ -1519,7 +1550,7 @@ export default function TradingJournal() {
               {(() => {
                 const dayTrades = allTrades[currentDate] || [];
                 if (dayTrades.length === 0) return null;
-                const trips = buildRoundTripsForDay(dayTrades);
+                const trips = ledger.byDate[currentDate] ? ledger.byDate[currentDate].trips : [];
                 const realized = trips.reduce((s, t) => s + t.pnl, 0);
                 const winners = trips.filter(t => t.pnl > 0.01).length;
                 const losers = trips.filter(t => t.pnl < -0.01).length;
@@ -1548,6 +1579,11 @@ export default function TradingJournal() {
                       <div style={{ display: 'flex', gap: 14, alignItems: 'center' }}>
                         <div style={{ fontSize: 11, color: '#10b981' }}>{winners}W</div>
                         <div style={{ fontSize: 11, color: '#ef4444' }}>{losers}L</div>
+                        {trips.some(t => t.kind === 'swing') && (
+                          <div style={{ fontSize: 11, color: '#71717a' }}>
+                            day {ledger.byDate[currentDate].day >= 0 ? '+' : '−'}${Math.abs(ledger.byDate[currentDate].day).toFixed(2)} · swing {ledger.byDate[currentDate].swing >= 0 ? '+' : '−'}${Math.abs(ledger.byDate[currentDate].swing).toFixed(2)}
+                          </div>
+                        )}
                         <div className="number-font" style={{ fontSize: 16, fontWeight: 600, color: realized >= 0 ? '#10b981' : '#ef4444' }}>
                           {realized >= 0 ? '+' : '−'}${Math.abs(realized).toFixed(2)}
                         </div>
@@ -1564,6 +1600,9 @@ export default function TradingJournal() {
                               <summary style={{ padding: '10px 14px', cursor: 'pointer', userSelect: 'none', display: 'flex', justifyContent: 'space-between', alignItems: 'center', listStyle: 'none' }}>
                                 <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
                                   <span className="number-font" style={{ fontWeight: 700, fontSize: 14 }}>{symbol}</span>
+                                  {symTrips.some(t => t.kind === 'swing') && (
+                                    <span style={{ fontSize: 9, color: '#93c5fd', background: 'rgba(59,130,246,0.12)', padding: '1px 6px', borderRadius: 999 }}>SWING</span>
+                                  )}
                                   <span style={{ fontSize: 11, color: '#71717a' }}>{symTrips.length} {symTrips.length === 1 ? 'trip' : 'trips'}</span>
                                 </div>
                                 <div className="number-font" style={{ fontSize: 14, fontWeight: 600, color: symPnl >= 0 ? '#10b981' : '#ef4444' }}>
@@ -1589,8 +1628,11 @@ export default function TradingJournal() {
                                       <tr key={i} style={{ borderTop: '1px solid rgba(255,255,255,0.03)' }}>
                                         <td style={{ padding: '6px 4px', color: t.side === 'long' ? '#6ee7b7' : '#fca5a5', fontSize: 11 }}>
                                           {t.side === 'long' ? 'LONG' : 'SHORT'}
+                                          {t.kind === 'swing' && (
+                                            <span style={{ marginLeft: 6, fontSize: 9, color: '#93c5fd', background: 'rgba(59,130,246,0.12)', padding: '1px 6px', borderRadius: 999 }}>SWING</span>
+                                          )}
                                         </td>
-                                        <td style={{ padding: '6px 4px', color: '#a1a1aa' }}>{t.entryTime}</td>
+                                        <td style={{ padding: '6px 4px', color: '#a1a1aa' }}>{t.kind === 'swing' ? 'prior day' : t.entryTime}</td>
                                         <td style={{ padding: '6px 4px', color: '#a1a1aa' }}>{t.exitTime}</td>
                                         <td style={{ padding: '6px 4px', textAlign: 'right' }}>{t.qty}</td>
                                         <td style={{ padding: '6px 4px', textAlign: 'right' }}>${t.entryPrice.toFixed(2)}</td>
@@ -1822,67 +1864,15 @@ export default function TradingJournal() {
 
         {/* ANALYTICS VIEW */}
         {view === 'analytics' && (() => {
-          // Build round-trip "trades" by pairing buys and sells per symbol per day (FIFO).
-          const buildRoundTrips = () => {
-            const trips = [];
-            Object.entries(allTrades).forEach(([date, dayTrades]) => {
-              const bySymbol = {};
-              dayTrades.forEach(t => {
-                if (!bySymbol[t.symbol]) bySymbol[t.symbol] = [];
-                bySymbol[t.symbol].push(t);
-              });
-              Object.entries(bySymbol).forEach(([symbol, trades]) => {
-                const sorted = [...trades].sort((a, b) => a.time.localeCompare(b.time));
-                const longQueue = [];
-                const shortQueue = [];
-                sorted.forEach(t => {
-                  let qty = Math.abs(t.qty);
-                  const isBuy = t.qty > 0;
-                  const price = t.price;
-                  const time = t.time;
-                  const commPerShare = qty > 0 ? t.commission / qty : 0;
-                  if (isBuy) {
-                    while (qty > 0 && shortQueue.length > 0) {
-                      const s = shortQueue[0];
-                      const closeQty = Math.min(qty, s.qty);
-                      const pnl = (s.price - price) * closeQty + (s.commission * (closeQty / s.origQty)) + commPerShare * closeQty;
-                      trips.push({
-                        date, symbol, side: 'short',
-                        entryTime: s.time, exitTime: time,
-                        qty: closeQty,
-                        entryPrice: s.price, exitPrice: price,
-                        pnl,
-                      });
-                      s.qty -= closeQty;
-                      qty -= closeQty;
-                      if (s.qty <= 0.0001) shortQueue.shift();
-                    }
-                    if (qty > 0) longQueue.push({ qty, origQty: qty, price, time, commission: commPerShare * qty });
-                  } else {
-                    while (qty > 0 && longQueue.length > 0) {
-                      const l = longQueue[0];
-                      const closeQty = Math.min(qty, l.qty);
-                      const pnl = (price - l.price) * closeQty + (l.commission * (closeQty / l.origQty)) + commPerShare * closeQty;
-                      trips.push({
-                        date, symbol, side: 'long',
-                        entryTime: l.time, exitTime: time,
-                        qty: closeQty,
-                        entryPrice: l.price, exitPrice: price,
-                        pnl,
-                      });
-                      l.qty -= closeQty;
-                      qty -= closeQty;
-                      if (l.qty <= 0.0001) longQueue.shift();
-                    }
-                    if (qty > 0) shortQueue.push({ qty, origQty: qty, price, time, commission: commPerShare * qty });
-                  }
-                });
-              });
-            });
-            return trips.sort((a, b) => (a.date + a.exitTime).localeCompare(b.date + b.exitTime));
-          };
-
-          const trips = buildRoundTrips();
+          // Round trips come from the trade ledger (FIFO across days, so positions held
+          // overnight are priced from the prior day's cost basis). Each trip is tagged
+          // 'day' (opened and closed the same day) or 'swing' (closed a carried position);
+          // the chips below filter the whole page to one kind or show both together.
+          const allTrips = ledger.trips;
+          const trips = tripKind === 'all' ? allTrips : allTrips.filter(t => t.kind === tripKind);
+          const dayTripsPnl = allTrips.filter(t => t.kind === 'day').reduce((s, t) => s + t.pnl, 0);
+          const swingTripsPnl = allTrips.filter(t => t.kind === 'swing').reduce((s, t) => s + t.pnl, 0);
+          const swingTripCount = allTrips.filter(t => t.kind === 'swing').length;
           const allTradesArr = Object.values(allTrades).flat();
 
           const winners = trips.filter(t => t.pnl > 0.01);
@@ -1910,7 +1900,7 @@ export default function TradingJournal() {
             else { curW = 0; curL = 0; }
           });
 
-          const totalFees = Math.abs(allTradesArr.reduce((s, t) => s + (t.commission || 0), 0));
+          const totalFees = Math.abs(trips.reduce((s, t) => s + (t.fees || 0), 0));
 
           const dowLabels = ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'];
           const dowPnL = [0, 0, 0, 0, 0, 0, 0];
@@ -1953,8 +1943,10 @@ export default function TradingJournal() {
             const [h, m, s] = t.split(':').map(Number);
             return h * 3600 + m * 60 + (s || 0);
           };
-          const avgHoldWinners = winners.length > 0 ? winners.reduce((s, t) => s + Math.max(0, timeToSeconds(t.exitTime) - timeToSeconds(t.entryTime)), 0) / winners.length : 0;
-          const avgHoldLosers = losers.length > 0 ? losers.reduce((s, t) => s + Math.max(0, timeToSeconds(t.exitTime) - timeToSeconds(t.entryTime)), 0) / losers.length : 0;
+          const holdWinners = winners.filter(t => t.kind === 'day');
+          const holdLosers = losers.filter(t => t.kind === 'day');
+          const avgHoldWinners = holdWinners.length > 0 ? holdWinners.reduce((s, t) => s + Math.max(0, timeToSeconds(t.exitTime) - timeToSeconds(t.entryTime)), 0) / holdWinners.length : 0;
+          const avgHoldLosers = holdLosers.length > 0 ? holdLosers.reduce((s, t) => s + Math.max(0, timeToSeconds(t.exitTime) - timeToSeconds(t.entryTime)), 0) / holdLosers.length : 0;
           const fmtDuration = (sec) => {
             if (sec < 60) return `${Math.round(sec)}s`;
             if (sec < 3600) return `${Math.round(sec / 60)}m`;
@@ -2090,12 +2082,36 @@ export default function TradingJournal() {
                     ? `${trips.length} round-trip ${trips.length === 1 ? 'trade' : 'trades'} across ${tradingDays} ${tradingDays === 1 ? 'day' : 'days'}`
                     : 'Import trades to see analytics'}
                 </div>
+                {allTrips.length > 0 && (
+                  <div style={{ display: 'flex', gap: 8, marginTop: 14, flexWrap: 'wrap', alignItems: 'center' }}>
+                    {[
+                      { id: 'all', label: 'All trades' },
+                      { id: 'day', label: 'Day trades' },
+                      { id: 'swing', label: `Swings${swingTripCount ? ` (${swingTripCount})` : ''}` },
+                    ].map(c => (
+                      <button key={c.id} onClick={() => setTripKind(c.id)}
+                        style={{
+                          padding: '6px 14px', borderRadius: 999, fontSize: 12, cursor: 'pointer',
+                          background: tripKind === c.id ? 'rgba(59,130,246,0.18)' : 'rgba(255,255,255,0.03)',
+                          border: `1px solid ${tripKind === c.id ? 'rgba(59,130,246,0.5)' : 'rgba(255,255,255,0.08)'}`,
+                          color: tripKind === c.id ? '#93c5fd' : '#a1a1aa',
+                        }}>
+                        {c.label}
+                      </button>
+                    ))}
+                    {ledger.unknown.length > 0 && (
+                      <span style={{ fontSize: 11, color: '#f59e0b' }}>
+                        {ledger.unknown.length} close{ledger.unknown.length === 1 ? '' : 's'} of older positions excluded (no cost basis — import the earlier day)
+                      </span>
+                    )}
+                  </div>
+                )}
               </div>
 
               {trips.length === 0 ? (
                 <div className="card" style={{ textAlign: 'center', padding: 60 }}>
                   <BarChart3 size={32} color="#52525b" style={{ marginBottom: 12 }} />
-                  <div style={{ fontSize: 15, color: '#a1a1aa', marginBottom: 4 }}>No data yet</div>
+                  <div style={{ fontSize: 15, color: '#a1a1aa', marginBottom: 4 }}>{allTrips.length > 0 ? `No ${tripKind === 'swing' ? 'swing' : 'day'} trades yet` : 'No data yet'}</div>
                   <div style={{ fontSize: 13, color: '#52525b' }}>Use the "Import .tlg" button in the sidebar to load trade history.</div>
                 </div>
               ) : (
@@ -2111,6 +2127,10 @@ export default function TradingJournal() {
                       <Tile label="Avg Daily P&L" value={`${avgDailyPnL >= 0 ? '+' : '−'}$${Math.abs(avgDailyPnL).toFixed(2)}`} valueColor={avgDailyPnL >= 0 ? '#10b981' : '#ef4444'} />
                       <Tile label="Profit Factor" value={isFinite(profitFactor) ? profitFactor.toFixed(2) : '∞'} valueColor="#93c5fd" />
                       <Tile label="Total Fees" value={`$${totalFees.toFixed(2)}`} valueColor="#f97316" />
+                    </div>
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, marginTop: 10 }}>
+                      <Tile label="Day-Trade P&L" value={`${dayTripsPnl >= 0 ? '+' : '−'}$${Math.abs(dayTripsPnl).toFixed(2)}`} valueColor={dayTripsPnl >= 0 ? '#10b981' : '#ef4444'} />
+                      <Tile label="Swing P&L" value={`${swingTripsPnl >= 0 ? '+' : '−'}$${Math.abs(swingTripsPnl).toFixed(2)}`} valueColor={swingTripsPnl >= 0 ? '#10b981' : '#ef4444'} sub={`${swingTripCount} ${swingTripCount === 1 ? 'close' : 'closes'}`} />
                     </div>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(140px, 1fr))', gap: 10, marginTop: 10 }}>
                       <Tile label="Total Trades" value={trips.length} />
@@ -2362,8 +2382,11 @@ export default function TradingJournal() {
               ) : (
                 dates.map(date => {
                   const dayTrades = allTrades[date];
-                  const { realized, unrealized, symbolPnl } = computeRealizedPnl(dayTrades);
+                  const dayLedger = ledger.byDate[date] || { day: 0, swing: 0, total: 0, trips: [], unknown: [], symbols: {} };
+                  const realized = dayLedger.total;
+                  const symbolPnl = dayLedger.symbols;
                   const symbols = Object.keys(symbolPnl);
+                  const hasSwing = dayLedger.trips.some(t => t.kind === 'swing');
                   return (
                     <div key={date} className="card">
                       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 16, flexWrap: 'wrap', gap: 12 }}>
@@ -2380,32 +2403,48 @@ export default function TradingJournal() {
                               {realized >= 0 ? '+' : '−'}${Math.abs(realized).toFixed(2)}
                             </div>
                           </div>
-                          {Math.abs(unrealized) > 0.01 && (
-                            <div style={{ textAlign: 'right' }}>
-                              <div style={{ fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#71717a', marginBottom: 2 }}>Open Cash Flow</div>
-                              <div className="number-font" style={{ fontSize: 14, fontWeight: 500, color: '#a1a1aa' }}>
-                                {unrealized >= 0 ? '+' : '−'}${Math.abs(unrealized).toFixed(2)}
+                          {hasSwing && (
+                            <>
+                              <div style={{ textAlign: 'right' }}>
+                                <div style={{ fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#71717a', marginBottom: 2 }}>Day trades</div>
+                                <div className="number-font" style={{ fontSize: 14, fontWeight: 500, color: dayLedger.day >= 0 ? '#10b981' : '#ef4444' }}>
+                                  {dayLedger.day >= 0 ? '+' : '−'}${Math.abs(dayLedger.day).toFixed(2)}
+                                </div>
                               </div>
-                            </div>
+                              <div style={{ textAlign: 'right' }}>
+                                <div style={{ fontSize: 10, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#93c5fd', marginBottom: 2 }}>Swings</div>
+                                <div className="number-font" style={{ fontSize: 14, fontWeight: 500, color: dayLedger.swing >= 0 ? '#10b981' : '#ef4444' }}>
+                                  {dayLedger.swing >= 0 ? '+' : '−'}${Math.abs(dayLedger.swing).toFixed(2)}
+                                </div>
+                              </div>
+                            </>
                           )}
                         </div>
                       </div>
+
+                      {dayLedger.unknown.length > 0 && (
+                        <div style={{ marginBottom: 12, padding: '8px 12px', borderRadius: 8, fontSize: 12, color: '#fbbf24', background: 'rgba(245,158,11,0.08)', border: '1px solid rgba(245,158,11,0.2)' }}>
+                          {dayLedger.unknown.map(u => `${u.symbol} ${Math.abs(u.qty)}`).join(', ')} closed a position opened before your earliest imported file, so there's no cost basis and it isn't counted. Import the earlier day's .tlg to include it.
+                        </div>
+                      )}
 
                       {/* Symbol summary */}
                       <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(140px, 1fr))', gap: 8, marginBottom: 16 }}>
                         {symbols.sort((a, b) => Math.abs(symbolPnl[b].pnl) - Math.abs(symbolPnl[a].pnl)).map(sym => {
                           const s = symbolPnl[sym];
-                          const isClosed = s.status === 'closed';
+                          const isClosed = Math.abs(s.openQty) < 0.01;
+                          const isSwing = Math.abs(s.swingPnl) > 0.005;
                           return (
-                            <div key={sym} style={{ padding: 10, background: 'rgba(255,255,255,0.02)', borderRadius: 8, border: `1px solid ${isClosed ? (s.pnl >= 0 ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)') : 'rgba(255,255,255,0.06)'}` }}>
+                            <div key={sym} style={{ padding: 10, background: 'rgba(255,255,255,0.02)', borderRadius: 8, border: `1px solid ${isClosed || Math.abs(s.pnl) >= 0.005 ? (s.pnl >= 0 ? 'rgba(16,185,129,0.2)' : 'rgba(239,68,68,0.2)') : 'rgba(255,255,255,0.06)'}` }}>
                               <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 4 }}>
                                 <span className="number-font" style={{ fontSize: 13, fontWeight: 600 }}>{sym}</span>
-                                {!isClosed && <span style={{ fontSize: 9, color: '#a1a1aa', background: 'rgba(255,255,255,0.06)', padding: '1px 6px', borderRadius: 999 }}>OPEN</span>}
+                                {isSwing && <span style={{ fontSize: 9, color: '#93c5fd', background: 'rgba(59,130,246,0.12)', padding: '1px 6px', borderRadius: 999 }}>SWING</span>}
+                                {!isClosed && <span style={{ fontSize: 9, color: '#a1a1aa', background: 'rgba(255,255,255,0.06)', padding: '1px 6px', borderRadius: 999 }}>HELD</span>}
                               </div>
-                              <div className="number-font" style={{ fontSize: 14, fontWeight: 600, color: isClosed ? (s.pnl >= 0 ? '#10b981' : '#ef4444') : '#71717a' }}>
-                                {isClosed ? (s.pnl >= 0 ? '+' : '−') + '$' + Math.abs(s.pnl).toFixed(2) : `${s.qty > 0 ? '+' : ''}${s.qty}`}
+                              <div className="number-font" style={{ fontSize: 14, fontWeight: 600, color: Math.abs(s.pnl) < 0.005 && !isClosed ? '#71717a' : (s.pnl >= 0 ? '#10b981' : '#ef4444') }}>
+                                {Math.abs(s.pnl) < 0.005 && !isClosed ? `${s.openQty > 0 ? '+' : ''}${s.openQty} sh` : (s.pnl >= 0 ? '+' : '−') + '$' + Math.abs(s.pnl).toFixed(2)}
                               </div>
-                              <div style={{ fontSize: 10, color: '#52525b', marginTop: 2 }}>{s.trades} {s.trades === 1 ? 'fill' : 'fills'}</div>
+                              <div style={{ fontSize: 10, color: '#52525b', marginTop: 2 }}>{s.fills} {s.fills === 1 ? 'fill' : 'fills'}{!isClosed && Math.abs(s.pnl) >= 0.005 ? ` · ${s.openQty > 0 ? '+' : ''}${s.openQty} still held` : ''}</div>
                             </div>
                           );
                         })}
