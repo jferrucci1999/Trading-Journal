@@ -2,6 +2,7 @@ import React, { useState, useEffect, useRef, useMemo } from 'react';
 import Head from 'next/head';
 import { createClient } from '@supabase/supabase-js';
 import { buildLedger, parsePositionLots, legacyDayPnl } from '../lib/pnl';
+import { DEFAULT_PLAYS, DEFAULT_CONFIG, RULES, EXIT_TYPES, tripKey, tripFacts, followedAll, playbookStats, dayStats } from '../lib/playbook';
 import { Moon, Zap, Target, Smile, AlertCircle, Coffee, BookOpen, Calendar, TrendingUp, Save, ChevronLeft, ChevronRight, Trash2, Sparkles, Upload, X, BarChart3, AlertTriangle, Lightbulb, FileText, ArrowDownToLine, Activity, LogOut, Mail, Lock, HardDriveDownload } from 'lucide-react';
 
 const todayKey = () => {
@@ -132,7 +133,7 @@ const migrateLocalDataToAccount = async (userId) => {
     const localKeys = [];
     for (let i = 0; i < window.localStorage.length; i++) {
       const k = window.localStorage.key(i);
-      if (k && (k.startsWith('entry:') || k.startsWith('trades:') || k.startsWith('config:') || k.startsWith('recap-'))) {
+      if (k && (k.startsWith('entry:') || k.startsWith('trades:') || k.startsWith('config:') || k.startsWith('tags:') || k.startsWith('recap-'))) {
         localKeys.push(k);
       }
     }
@@ -300,6 +301,11 @@ export default function TradingJournal() {
   const [allTrades, setAllTrades] = useState({}); // keyed by date
   const [allPositions, setAllPositions] = useState({}); // end-of-day open-lot snapshots, keyed by date
   const [tripKind, setTripKind] = useState('all'); // analytics filter: 'all' | 'day' | 'swing'
+  const [allTags, setAllTags] = useState({}); // playbook tags per round trip: { date: { tripKey: Tag } }
+  const [plays, setPlays] = useState(DEFAULT_PLAYS);
+  const [pbConfig, setPbConfig] = useState(DEFAULT_CONFIG); // { sizeCap, microMaxPrice }
+  const [pbRange, setPbRange] = useState('all'); // playbook stats window: 'all' | '30' | '7'
+  const [newPlay, setNewPlay] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [savedFlash, setSavedFlash] = useState(false);
@@ -382,6 +388,12 @@ export default function TradingJournal() {
     workOn: [],
     bestDecision: '',
     screenshots: [],
+    // Process fields (older entries won't have these; always read with a default)
+    processGrade: '',
+    compulsionResisted: 0,
+    studyMinutes: '',
+    marketIndices: '',
+    microVolume: '',
     savedAt: null,
   });
 
@@ -441,10 +453,29 @@ export default function TradingJournal() {
           entries = fixed.entries;
         }
 
+        // Playbook tags (one record per day) and the playbook settings
+        const tags = {};
+        try {
+          const tagList = await storage.list('tags:');
+          for (const key of (tagList && tagList.keys) || []) {
+            try {
+              const r = await storage.get(key);
+              if (r) tags[key.replace('tags:', '')] = JSON.parse(r.value);
+            } catch (e) {}
+          }
+        } catch (e) {}
+        try {
+          const p = await storage.get('config:playbook_plays');
+          if (p && p.value) { const arr = JSON.parse(p.value); if (Array.isArray(arr) && arr.length) setPlays(arr); }
+          const c = await storage.get('config:playbook_cfg');
+          if (c && c.value) setPbConfig({ ...DEFAULT_CONFIG, ...JSON.parse(c.value) });
+        } catch (e) {}
+
         setAllEntries(entries);
         setEntry(entries[currentDate] || blankEntry());
         setAllTrades(trades);
         setAllPositions(positions);
+        setAllTags(tags);
 
         // Load Finnhub API key
         try {
@@ -849,6 +880,50 @@ export default function TradingJournal() {
     }
   };
 
+  // Playbook tags. Saved straight away (one record per day), separate from the
+  // journal entry so tagging never needs the Save button.
+  const saveTagsForDate = async (date, dayTags) => {
+    setAllTags((prev) => ({ ...prev, [date]: dayTags }));
+    try {
+      await storage.set(`tags:${date}`, JSON.stringify(dayTags));
+    } catch (e) {
+      alert('Could not save tag. Try again.');
+    }
+  };
+
+  const updateTripTag = (date, trip, patch) => {
+    const key = tripKey(trip);
+    const day = allTags[date] || {};
+    const cur = day[key] || { play: '', broke: [], exit: '', note: '' };
+    saveTagsForDate(date, { ...day, [key]: { ...cur, ...patch } });
+  };
+
+  const toggleBroken = (date, trip, ruleId) => {
+    const cur = ((allTags[date] || {})[tripKey(trip)] || {}).broke || [];
+    updateTripTag(date, trip, { broke: cur.includes(ruleId) ? cur.filter((r) => r !== ruleId) : [...cur, ruleId] });
+  };
+
+  // Apply one play to every not-yet-tagged round trip of a symbol that day.
+  const tagSymbolTrips = (date, symTrips, play) => {
+    const day = { ...(allTags[date] || {}) };
+    symTrips.forEach((t) => {
+      const key = tripKey(t);
+      const cur = day[key] || { play: '', broke: [], exit: '', note: '' };
+      if (!cur.play) day[key] = { ...cur, play };
+    });
+    saveTagsForDate(date, day);
+  };
+
+  const savePlays = async (next) => {
+    setPlays(next);
+    try { await storage.set('config:playbook_plays', JSON.stringify(next)); } catch (e) { alert('Could not save plays.'); }
+  };
+
+  const savePbConfig = async (next) => {
+    setPbConfig(next);
+    try { await storage.set('config:playbook_cfg', JSON.stringify(next)); } catch (e) { alert('Could not save settings.'); }
+  };
+
   const saveEntry = async () => {
     if (!entry) return;
     setSaving(true);
@@ -993,6 +1068,18 @@ export default function TradingJournal() {
           outline: none;
           transition: border-color 0.15s, background 0.15s;
         }
+        select.pb-select {
+          font-family: inherit; font-size: 12px;
+          background: rgba(255,255,255,0.04);
+          border: 1px solid rgba(255,255,255,0.1);
+          color: #e4e4e7; border-radius: 6px; padding: 5px 8px; outline: none;
+        }
+        select.pb-select option { background: #0f1424; color: #e4e4e7; }
+        .pb-chip {
+          font-size: 11px; padding: 3px 9px; border-radius: 999px; cursor: pointer; user-select: none;
+          border: 1px solid rgba(255,255,255,0.1); color: #a1a1aa; background: transparent;
+        }
+        .pb-chip.on { background: rgba(239,68,68,0.15); border-color: rgba(239,68,68,0.45); color: #fca5a5; }
         textarea:focus, input:focus {
           border-color: rgba(59, 130, 246, 0.5);
           background: rgba(255,255,255,0.05);
@@ -1214,6 +1301,9 @@ export default function TradingJournal() {
                 {Object.values(allTrades).reduce((s, t) => s + t.length, 0)}
               </span>
             )}
+          </button>
+          <button className={`side-btn ${view === 'playbook' ? 'active' : ''}`} onClick={() => setView('playbook')}>
+            <Target size={16} /> Playbook
           </button>
           <button className={`side-btn ${view === 'earnings' ? 'active' : ''}`} onClick={() => setView('earnings')}>
             <Lightbulb size={16} /> Earnings
@@ -1490,6 +1580,45 @@ export default function TradingJournal() {
                   ))}
                 </div>
               </div>
+
+              <div className="card">
+                <div style={{ fontSize: 12, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#71717a', marginBottom: 14 }}>Process</div>
+
+                <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Day grade (process, not P&L)</div>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                  {['A', 'B', 'C', 'D', 'F'].map(g => (
+                    <span key={g} className={`tag ${entry.processGrade === g ? 'active' : ''}`}
+                      onClick={() => setEntry({ ...entry, processGrade: entry.processGrade === g ? '' : g })}>{g}</span>
+                  ))}
+                </div>
+
+                <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Compulsions resisted (felt the urge, didn't trade)</div>
+                <div style={{ display: 'flex', alignItems: 'center', gap: 12, marginBottom: 16 }}>
+                  <button className="tag" style={{ minWidth: 34 }} onClick={() => setEntry({ ...entry, compulsionResisted: Math.max(0, (Number(entry.compulsionResisted) || 0) - 1) })}>−</button>
+                  <span className="number-font" style={{ fontSize: 20, fontWeight: 600, minWidth: 24, textAlign: 'center' }}>{Number(entry.compulsionResisted) || 0}</span>
+                  <button className="tag" style={{ minWidth: 34 }} onClick={() => setEntry({ ...entry, compulsionResisted: (Number(entry.compulsionResisted) || 0) + 1 })}>+</button>
+                </div>
+
+                <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Market (Qs / SPY)</div>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                  {[['down', 'Down'], ['flat', 'Flat / choppy'], ['up', 'Up']].map(([id, label]) => (
+                    <span key={id} className={`tag ${entry.marketIndices === id ? 'active' : ''}`}
+                      onClick={() => setEntry({ ...entry, marketIndices: entry.marketIndices === id ? '' : id })}>{label}</span>
+                  ))}
+                </div>
+
+                <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Micro volume</div>
+                <div style={{ display: 'flex', gap: 6, marginBottom: 16 }}>
+                  {[['thin', 'Thin'], ['normal', 'Normal'], ['hot', 'Hot']].map(([id, label]) => (
+                    <span key={id} className={`tag ${entry.microVolume === id ? 'active' : ''}`}
+                      onClick={() => setEntry({ ...entry, microVolume: entry.microVolume === id ? '' : id })}>{label}</span>
+                  ))}
+                </div>
+
+                <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Study time (minutes: SMB videos, Level 2)</div>
+                <input type="number" min="0" placeholder="0" value={entry.studyMinutes ?? ''} onChange={(e) => setEntry({ ...entry, studyMinutes: e.target.value })} />
+                <div style={{ fontSize: 11, color: '#52525b', marginTop: 10 }}>Saved with the Save button, like the rest of the entry.</div>
+              </div>
             </div>
 
             <div style={{ display: 'grid', gap: 20 }}>
@@ -1554,6 +1683,8 @@ export default function TradingJournal() {
                 const realized = trips.reduce((s, t) => s + t.pnl, 0);
                 const winners = trips.filter(t => t.pnl > 0.01).length;
                 const losers = trips.filter(t => t.pnl < -0.01).length;
+                const dayTags = allTags[currentDate] || {};
+                const dayFacts = tripFacts(trips.filter(t => t.kind === 'day'), pbConfig);
 
                 // Group by symbol for display
                 const bySymbol = {};
@@ -1610,6 +1741,15 @@ export default function TradingJournal() {
                                 </div>
                               </summary>
                               <div style={{ padding: '0 14px 12px', borderTop: '1px solid rgba(255,255,255,0.04)' }}>
+                                {symTrips.some(t => t.kind === 'day') && (
+                                  <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginTop: 10, fontSize: 11, color: '#71717a' }}>
+                                    <span>Tag every untagged {symbol} trip as</span>
+                                    <select className="pb-select" value="" onChange={(e) => { if (e.target.value) tagSymbolTrips(currentDate, symTrips.filter(t => t.kind === 'day'), e.target.value); }}>
+                                      <option value="">play…</option>
+                                      {plays.map(p => <option key={p} value={p}>{p}</option>)}
+                                    </select>
+                                  </div>
+                                )}
                                 <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, marginTop: 8 }}>
                                   <thead>
                                     <tr style={{ color: '#52525b', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
@@ -1625,7 +1765,8 @@ export default function TradingJournal() {
                                   </thead>
                                   <tbody className="number-font">
                                     {symTrips.map((t, i) => (
-                                      <tr key={i} style={{ borderTop: '1px solid rgba(255,255,255,0.03)' }}>
+                                      <React.Fragment key={i}>
+                                      <tr style={{ borderTop: '1px solid rgba(255,255,255,0.03)' }}>
                                         <td style={{ padding: '6px 4px', color: t.side === 'long' ? '#6ee7b7' : '#fca5a5', fontSize: 11 }}>
                                           {t.side === 'long' ? 'LONG' : 'SHORT'}
                                           {t.kind === 'swing' && (
@@ -1642,6 +1783,43 @@ export default function TradingJournal() {
                                           {t.pnl >= 0 ? '+' : '−'}${Math.abs(t.pnl).toFixed(2)}
                                         </td>
                                       </tr>
+                                      {t.kind === 'day' && (() => {
+                                        const tag = dayTags[tripKey(t)] || { play: '', broke: [], exit: '' };
+                                        const fact = dayFacts[tripKey(t)];
+                                        const ok = followedAll(tag, fact);
+                                        return (
+                                          <tr>
+                                            <td colSpan={8} style={{ padding: '2px 4px 10px' }}>
+                                              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 8 }}>
+                                                <select className="pb-select" value={tag.play || ''} onChange={(e) => updateTripTag(currentDate, t, { play: e.target.value })}>
+                                                  <option value="">Play…</option>
+                                                  {plays.map(p => <option key={p} value={p}>{p}</option>)}
+                                                </select>
+                                                <select className="pb-select" value={tag.exit || ''} onChange={(e) => updateTripTag(currentDate, t, { exit: e.target.value })}>
+                                                  <option value="">Exit…</option>
+                                                  {EXIT_TYPES.map(x => <option key={x.id} value={x.id}>{x.label}</option>)}
+                                                </select>
+                                                <span style={{ fontSize: 11, color: '#71717a' }}>
+                                                  #{fact.tradeNo} on {t.symbol} · ${fact.size.toFixed(0)} in
+                                                </span>
+                                                {fact.overCap && <span style={{ fontSize: 10, color: '#fca5a5', background: 'rgba(239,68,68,0.12)', padding: '1px 7px', borderRadius: 999 }}>OVER ${pbConfig.sizeCap} CAP</span>}
+                                                {tag.play && (
+                                                  <span style={{ fontSize: 10, padding: '1px 7px', borderRadius: 999, color: ok ? '#6ee7b7' : '#fcd34d', background: ok ? 'rgba(16,185,129,0.12)' : 'rgba(245,158,11,0.12)' }}>
+                                                    {ok ? 'FOLLOWED RULES' : 'BROKE A RULE'}
+                                                  </span>
+                                                )}
+                                              </div>
+                                              <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 6, marginTop: 6 }}>
+                                                <span style={{ fontSize: 10, color: '#52525b', textTransform: 'uppercase', letterSpacing: '0.08em' }}>Broke:</span>
+                                                {RULES.map(r => (
+                                                  <span key={r.id} className={`pb-chip ${(tag.broke || []).includes(r.id) ? 'on' : ''}`} onClick={() => toggleBroken(currentDate, t, r.id)}>{r.label}</span>
+                                                ))}
+                                              </div>
+                                            </td>
+                                          </tr>
+                                        );
+                                      })()}
+                                      </React.Fragment>
                                     ))}
                                   </tbody>
                                 </table>
@@ -2496,6 +2674,194 @@ export default function TradingJournal() {
         })()}
 
         {/* EARNINGS VIEW */}
+        {/* PLAYBOOK VIEW */}
+        {view === 'playbook' && (() => {
+          const from = pbRange === 'all' ? null : (() => {
+            const d = new Date(); d.setDate(d.getDate() - Number(pbRange));
+            return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+          })();
+          const stats = playbookStats(ledger.trips, allTags, pbConfig, { from });
+          const days = dayStats(allEntries, { from });
+          const money = (v) => v == null ? '—' : `${v >= 0 ? '+' : '−'}$${Math.abs(v).toFixed(2)}`;
+          const pct = (v) => v == null ? '—' : `${Math.round(v * 100)}%`;
+          const col = (v) => v == null ? '#a1a1aa' : v >= 0 ? '#10b981' : '#ef4444';
+          const label = { fontSize: 12, letterSpacing: '0.15em', textTransform: 'uppercase', color: '#71717a', marginBottom: 12 };
+          const th = { textAlign: 'right', padding: '6px 6px', fontWeight: 500 };
+          const td = { textAlign: 'right', padding: '7px 6px' };
+          const head = (first) => (
+            <tr style={{ color: '#52525b', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+              <th style={{ ...th, textAlign: 'left' }}>{first}</th>
+              <th style={th}>Trades</th><th style={th}>Win %</th><th style={th}>Avg win</th><th style={th}>Avg loss</th>
+              <th style={th}>Per trade</th><th style={th}>PF</th><th style={th}>P&L</th>
+            </tr>
+          );
+          const row = (name, b, key, dim) => (
+            <tr key={key || name} style={{ borderTop: '1px solid rgba(255,255,255,0.04)', opacity: dim ? 0.6 : 1 }}>
+              <td style={{ ...td, textAlign: 'left' }}>{name}{b.n > 0 && b.n < 20 && <span style={{ marginLeft: 6, fontSize: 9, color: '#71717a' }}>small sample</span>}</td>
+              <td style={td}>{b.n}</td>
+              <td style={td}>{pct(b.winRate)}</td>
+              <td style={{ ...td, color: '#6ee7b7' }}>{money(b.avgWin)}</td>
+              <td style={{ ...td, color: '#fca5a5' }}>{money(b.avgLoss)}</td>
+              <td style={{ ...td, color: col(b.expectancy) }}>{money(b.expectancy)}</td>
+              <td style={td}>{b.profitFactor == null ? '—' : b.profitFactor === Infinity ? '∞' : b.profitFactor.toFixed(2)}</td>
+              <td style={{ ...td, color: col(b.pnl), fontWeight: 600 }}>{money(b.pnl)}</td>
+            </tr>
+          );
+          const playRows = Object.entries(stats.plays).sort((a, b) => (a[0] === '(untagged)') - (b[0] === '(untagged)') || b[1].n - a[1].n);
+          const gradeOrder = ['A', 'B', 'C', 'D', 'F'];
+          const empty = stats.coverage.total === 0;
+
+          return (
+            <div className="fade-in" style={{ display: 'grid', gap: 20 }}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', flexWrap: 'wrap', gap: 10 }}>
+                <div>
+                  <div className="display-font" style={{ fontSize: 32 }}>Playbook</div>
+                  <div style={{ fontSize: 12, color: '#71717a', marginTop: 2 }}>
+                    {stats.coverage.tagged} of {stats.coverage.total} day-trade round trips tagged{stats.coverage.total > stats.coverage.tagged ? ' — untagged trips only count in the totals below' : ''}
+                  </div>
+                </div>
+                <div style={{ display: 'flex', gap: 6 }}>
+                  {[['all', 'All time'], ['30', '30 days'], ['7', '7 days']].map(([id, lbl]) => (
+                    <span key={id} className={`tag ${pbRange === id ? 'active' : ''}`} onClick={() => setPbRange(id)}>{lbl}</span>
+                  ))}
+                </div>
+              </div>
+
+              {empty && (
+                <div className="card" style={{ color: '#a1a1aa', fontSize: 13 }}>
+                  No day-trade round trips in this window yet. Import a .tlg file, then open Journal Entry and tag each trade's play, exit and any rules you broke. Stats fill in as you tag.
+                </div>
+              )}
+
+              {!empty && (
+                <>
+                  <div className="card" style={{ overflowX: 'auto' }}>
+                    <div style={label}>By play</div>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, minWidth: 560 }}>
+                      <thead>{head('Play')}</thead>
+                      <tbody className="number-font">
+                        {playRows.map(([name, b]) => row(name, b, name, name === '(untagged)'))}
+                        {row('All trades', stats.overall, 'all')}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  <div className="card" style={{ overflowX: 'auto' }}>
+                    <div style={label}>Rules: what helps, what hurts</div>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, minWidth: 560 }}>
+                      <thead>{head('Condition')}</thead>
+                      <tbody className="number-font">
+                        {row('Followed every rule', stats.followed.yes, 'fy')}
+                        {row('Broke at least one', stats.followed.no, 'fn')}
+                        {row(`Size within $${pbConfig.sizeCap} (micros)`, stats.size.within, 'sw')}
+                        {row(`Size over $${pbConfig.sizeCap} (micros)`, stats.size.over, 'so')}
+                        {RULES.map(r => (
+                          <React.Fragment key={r.id}>
+                            {row(`${r.label}: kept`, stats.rules[r.id].followed, `${r.id}-k`)}
+                            {row(`${r.label}: broke`, stats.rules[r.id].broke, `${r.id}-b`)}
+                          </React.Fragment>
+                        ))}
+                      </tbody>
+                    </table>
+                    <div style={{ fontSize: 11, color: '#52525b', marginTop: 10 }}>
+                      Compare "Per trade" between kept and broke. A rule only helps if the kept side is clearly better over a decent sample (20+ trades each).
+                    </div>
+                  </div>
+
+                  <div className="card" style={{ overflowX: 'auto' }}>
+                    <div style={label}>Overtrading: nth entry on the same ticker, same day</div>
+                    <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, minWidth: 560 }}>
+                      <thead>{head('Entry #')}</thead>
+                      <tbody className="number-font">
+                        {Object.entries(stats.byTradeNo).sort((a, b) => Number(a[0]) - Number(b[0])).map(([n, b]) => row(Number(n) >= 4 ? '4th or later' : `#${n}`, b, `no-${n}`))}
+                      </tbody>
+                    </table>
+                  </div>
+
+                  {Object.keys(stats.exits).length > 0 && (
+                    <div className="card" style={{ overflowX: 'auto' }}>
+                      <div style={label}>By exit type</div>
+                      <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12, minWidth: 560 }}>
+                        <thead>{head('Exit')}</thead>
+                        <tbody className="number-font">
+                          {EXIT_TYPES.filter(x => stats.exits[x.id]).map(x => row(x.label, stats.exits[x.id], x.id))}
+                        </tbody>
+                      </table>
+                    </div>
+                  )}
+                </>
+              )}
+
+              <div className="card">
+                <div style={label}>Process (from day entries)</div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(150px, 1fr))', gap: 10, marginBottom: 14 }}>
+                  {[
+                    ['Compulsions resisted', days.resisted],
+                    ['Study minutes', days.studyMinutes],
+                    ['Avg study / day', `${days.avgStudy}m`],
+                  ].map(([k, v]) => (
+                    <div key={k} style={{ padding: '10px 12px', background: 'rgba(255,255,255,0.03)', borderRadius: 8, border: '1px solid rgba(255,255,255,0.04)' }}>
+                      <div style={{ fontSize: 10, color: '#71717a', textTransform: 'uppercase', letterSpacing: '0.08em' }}>{k}</div>
+                      <div className="number-font" style={{ fontSize: 20, fontWeight: 600, marginTop: 2 }}>{v}</div>
+                    </div>
+                  ))}
+                </div>
+                {Object.keys(days.grades).length > 0 ? (
+                  <table style={{ width: '100%', borderCollapse: 'collapse', fontSize: 12 }}>
+                    <thead>
+                      <tr style={{ color: '#52525b', fontSize: 10, letterSpacing: '0.1em', textTransform: 'uppercase' }}>
+                        <th style={{ ...th, textAlign: 'left' }}>Day grade</th><th style={th}>Days</th><th style={th}>Avg day P&L</th>
+                      </tr>
+                    </thead>
+                    <tbody className="number-font">
+                      {gradeOrder.filter(g => days.grades[g]).map(g => (
+                        <tr key={g} style={{ borderTop: '1px solid rgba(255,255,255,0.04)' }}>
+                          <td style={{ ...td, textAlign: 'left' }}>{g}</td>
+                          <td style={td}>{days.grades[g].days}</td>
+                          <td style={{ ...td, color: col(days.grades[g].avgPnl) }}>{money(days.grades[g].avgPnl)}</td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                ) : (
+                  <div style={{ fontSize: 12, color: '#71717a' }}>Grade your days in Journal Entry → Process to see how process grade lines up with P&L.</div>
+                )}
+              </div>
+
+              <div className="card">
+                <div style={label}>Playbook settings</div>
+                <div style={{ fontSize: 11, color: '#71717a', marginBottom: 8 }}>Plays (these fill the Play dropdown on each trade)</div>
+                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, marginBottom: 10 }}>
+                  {plays.map(p => (
+                    <span key={p} className="tag active" style={{ display: 'inline-flex', alignItems: 'center', gap: 6 }}>
+                      {p}
+                      <X size={12} style={{ cursor: 'pointer' }} onClick={() => { if (confirm(`Remove "${p}" from the list? Trades already tagged with it keep the name.`)) savePlays(plays.filter(x => x !== p)); }} />
+                    </span>
+                  ))}
+                </div>
+                <div style={{ display: 'flex', gap: 8, marginBottom: 18 }}>
+                  <input placeholder="Add a play, e.g. Gap and go" value={newPlay} onChange={(e) => setNewPlay(e.target.value)}
+                    onKeyDown={(e) => { if (e.key === 'Enter' && newPlay.trim() && !plays.includes(newPlay.trim())) { savePlays([...plays, newPlay.trim()]); setNewPlay(''); } }} />
+                  <button className="tag" onClick={() => { const v = newPlay.trim(); if (v && !plays.includes(v)) { savePlays([...plays, v]); setNewPlay(''); } }}>Add</button>
+                </div>
+                <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 12 }}>
+                  <div>
+                    <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Micro size cap per entry ($)</div>
+                    <input type="number" min="0" value={pbConfig.sizeCap} onChange={(e) => savePbConfig({ ...pbConfig, sizeCap: Number(e.target.value) || 0 })} />
+                  </div>
+                  <div>
+                    <div style={{ fontSize: 11, color: '#71717a', marginBottom: 6 }}>Cap applies below this share price ($)</div>
+                    <input type="number" min="0" value={pbConfig.microMaxPrice} onChange={(e) => savePbConfig({ ...pbConfig, microMaxPrice: Number(e.target.value) || 0 })} />
+                  </div>
+                </div>
+                <div style={{ fontSize: 11, color: '#52525b', marginTop: 10 }}>
+                  Stats count day trades only (swings excluded). A trade counts as "followed every rule" when it has a play, no rule marked broken, and size within the cap.
+                </div>
+              </div>
+            </div>
+          );
+        })()}
+
         {view === 'earnings' && (() => {
           const grouped = {
             bmo: earningsData?.bmo || [],
